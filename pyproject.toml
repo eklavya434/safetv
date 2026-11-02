@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "safetv"
+version = "1.0.0"
+description = "SafeTV: Video Action-Based Violence Detection Engine"
+readme = "README.md"
+authors = [{ name = "eklavya434" }]
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "opencv-python-headless>=4.8.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+]
+
+[project.scripts]
+safetv = "run_safetv:main"
