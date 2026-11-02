@@ -173,20 +173,21 @@ class SyntheticVideoGenerator:
                 # Violent brawl
                 frame = cls.create_canvas(width, height, bg_color=(220, 220, 225))
                 brawl_t = t - start_frame
-                impact = 18 * math.sin(brawl_t * 1.8) * math.cos(brawl_t * 3.1)
-                tumble = 12 * math.sin(brawl_t * 2.5)
+                scale = min(width / 160.0, height / 120.0)
+                impact = 18 * scale * math.sin(brawl_t * 1.8) * math.cos(brawl_t * 3.1)
+                tumble = 12 * scale * math.sin(brawl_t * 2.5)
 
-                pos_x1 = int(np.clip(width // 2 - 12 + impact, 15, width - 15))
-                pos_y1 = int(np.clip(height // 2 + tumble, 15, height - 15))
-                pos_x2 = int(np.clip(width // 2 + 12 - impact * 0.85, 15, width - 15))
-                pos_y2 = int(np.clip(height // 2 - tumble * 0.9, 15, height - 15))
+                pos_x1 = int(np.clip(width // 2 - int(12 * scale) + impact, int(15 * scale), width - int(15 * scale)))
+                pos_y1 = int(np.clip(height // 2 + tumble, int(15 * scale), height - int(15 * scale)))
+                pos_x2 = int(np.clip(width // 2 + int(12 * scale) - impact * 0.85, int(15 * scale), width - int(15 * scale)))
+                pos_y2 = int(np.clip(height // 2 - tumble * 0.9, int(15 * scale), height - int(15 * scale)))
 
-                strike_x = int((pos_x1 + pos_x2) / 2 + 12 * math.cos(brawl_t * 4.2))
-                strike_y = int((pos_y1 + pos_y2) / 2 + 12 * math.sin(brawl_t * 4.2))
+                strike_x = int((pos_x1 + pos_x2) / 2 + 12 * scale * math.cos(brawl_t * 4.2))
+                strike_y = int((pos_y1 + pos_y2) / 2 + 12 * scale * math.sin(brawl_t * 4.2))
 
-                cls._draw_entity(frame, pos_x1, pos_y1, radius=12, color=(180, 30, 30))
-                cls._draw_entity(frame, pos_x2, pos_y2, radius=12, color=(30, 30, 180))
-                cls._draw_entity(frame, strike_x, strike_y, radius=7, color=(230, 180, 20))
+                cls._draw_entity(frame, pos_x1, pos_y1, radius=int(12 * scale), color=(180, 30, 30))
+                cls._draw_entity(frame, pos_x2, pos_y2, radius=int(12 * scale), color=(30, 30, 180))
+                cls._draw_entity(frame, strike_x, strike_y, radius=int(7 * scale), color=(230, 180, 20))
 
             frames.append(frame)
 
