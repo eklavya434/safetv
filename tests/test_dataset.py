@@ -19,6 +19,7 @@ from safetv.data.dataset import SafeTVVideoDataset, create_video_dataloaders
 from safetv.data.downloader import DatasetDownloader
 from safetv.data.preprocessor import PreprocessedClip, VideoPreprocessor
 from safetv.data.video_inspector import VideoInspector
+from prepare_dataset import parse_video_label
 
 
 class TestVideoInspector(unittest.TestCase):
@@ -161,6 +162,44 @@ class TestDatasetAndDataLoader(unittest.TestCase):
         self.assertEqual(videos.shape[4], 112)
         self.assertEqual(labels.ndim, 1)
         self.assertTrue(all(lbl in [0, 1] for lbl in labels.tolist()))
+
+
+class TestDatasetLabellingBug(unittest.TestCase):
+    """
+    Validates fix for dataset labelling bug where substring 'viol'
+    inside 'non_violence' caused catastrophic misclassification.
+    """
+
+    def test_parse_video_label_non_violence_not_mislabeled(self):
+        """Ensures directories or filenames with 'non_violence' are classified as class 0."""
+        paths_non_violence = [
+            os.path.join("data", "raw", "non_violence", "nv_001.mp4"),
+            os.path.join("data", "raw", "non-violence", "run_042.mp4"),
+            os.path.join("data", "raw", "nonviolence", "dance_100.mp4"),
+            os.path.join("videos", "walk_in_park.mp4"),
+            os.path.join("benchmark", "exercising_fast.mp4"),
+        ]
+        for p in paths_non_violence:
+            label_str, label_id = parse_video_label(p)
+            self.assertEqual(label_str, "non_violence", f"Failed for {p}")
+            self.assertEqual(label_id, 0, f"Failed for {p}")
+
+    def test_parse_video_label_violence(self):
+        """Ensures true violence paths are classified as class 1."""
+        paths_violence = [
+            os.path.join("data", "raw", "violence", "punching_001.mp4"),
+            os.path.join("data", "raw", "violence", "fight_scene.mp4"),
+            os.path.join("clips", "kicking_street_brawl.mp4"),
+        ]
+        for p in paths_violence:
+            label_str, label_id = parse_video_label(p)
+            self.assertEqual(label_str, "violence", f"Failed for {p}")
+            self.assertEqual(label_id, 1, f"Failed for {p}")
+
+    def test_parse_video_label_ambiguous_rejected(self):
+        """Ensures paths with no discernible category raise ValueError instead of guessing."""
+        with self.assertRaises(ValueError):
+            parse_video_label("unknown_folder/unlabeled_stream_99.mp4")
 
 
 if __name__ == "__main__":

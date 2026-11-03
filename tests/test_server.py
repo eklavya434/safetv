@@ -79,13 +79,15 @@ class TestSafeTVServer(unittest.TestCase):
             inc_id = str(first_inc["incident_id"])
 
             review_payload = {
-                "status": "CONFIRMED_VIOLENCE",
+                "decision": "TRUE_POSITIVE",
                 "reviewer_notes": "Verified by security lead; immediate dispatch required.",
                 "reviewer_name": "Lead Guard",
             }
             review_resp = self.client.post(f"/api/incidents/{inc_id}/review", json=review_payload)
             self.assertEqual(review_resp.status_code, 200)
-            self.assertEqual(review_resp.json()["status"], "CONFIRMED_VIOLENCE")
+            res_json = review_resp.json()
+            self.assertTrue(res_json["success"])
+            self.assertEqual(res_json["review"]["decision"], "TRUE_POSITIVE")
 
     def test_stream_window_inference(self):
         """Validates live webcam frame batch streaming and inference."""
@@ -142,6 +144,41 @@ class TestSafeTVServer(unittest.TestCase):
         # Cleanup camera
         del_resp = self.client.delete("/api/cameras/api_test_cam")
         self.assertEqual(del_resp.status_code, 200)
+
+    def test_path_traversal_evidence_rejected(self):
+        """Validates that path traversal attacks on /api/evidence/{filename} are rejected."""
+        traversal_attempts = [
+            "..%2F..%2Fconfig.py",
+            "../../etc/passwd",
+            "..\\..\\Windows\\System32\\cmd.exe",
+            "nonexistent_file_xyz.mp4"
+        ]
+        for attempt in traversal_attempts:
+            resp = self.client.get(f"/api/evidence/{attempt}")
+            self.assertIn(resp.status_code, [404, 400], f"Failed to reject traversal for: {attempt}")
+
+    def test_webcam_session_lifecycle_and_chunk(self):
+        """Validates webcam session start, chunk inference, and session close."""
+        # 1. Start session
+        start_resp = self.client.post("/api/webcam/session/start")
+        self.assertEqual(start_resp.status_code, 200)
+        start_data = start_resp.json()
+        self.assertTrue(start_data["success"])
+        session_id = start_data["session_id"]
+        self.assertIsNotNone(session_id)
+
+        # 2. Stop session
+        stop_resp = self.client.post("/api/webcam/session/stop", json={"session_id": session_id})
+        self.assertEqual(stop_resp.status_code, 200)
+        self.assertTrue(stop_resp.json()["success"])
+
+    def test_export_reviewed_dataset_endpoint(self):
+        """Validates dataset export endpoint for reviewed incidents."""
+        resp = self.client.post("/api/incidents/export-dataset")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["success"])
+        self.assertIn("export_summary", data)
 
 
 if __name__ == "__main__":

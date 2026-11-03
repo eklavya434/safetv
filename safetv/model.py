@@ -2,20 +2,32 @@
 Video Action Recognition Model Backbone for SafeTV.
 Provides spatiotemporal 3D convolution / factorized (2+1)D feature extraction
 and binary violence action classification using genuinely trained weights.
+Enforces strict model integrity and checkpoint validation.
 """
 
+import hashlib
+import json
+import logging
 import os
 from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from .config import ModelConfig
 
+logger = logging.getLogger("safetv.model")
+
+
+class ModelNotReadyError(RuntimeError):
+    """Raised when inference is requested but no valid trained model checkpoint is loaded."""
+    pass
+
 
 class VideoActionClassifier:
     """
     Spatiotemporal action recognition engine for SafeTV.
-    Distinguishes potential violence from normal high/low-energy human activities
-    using genuinely fine-tuned deep representations.
+    Distinguishes potential violence from normal human activities using
+    genuinely fine-tuned deep representations.
+    Outputs pure neural network softmax probabilities without heuristic blending.
     """
 
     def __init__(self, config: Optional[ModelConfig] = None):
@@ -23,12 +35,28 @@ class VideoActionClassifier:
         self.model = None
         self.device = None
         self.is_trained: bool = False
+        self.is_ready: bool = False
         self.provenance: str = "uninitialized"
         self.loaded_checkpoint: Optional[str] = None
+        self.checkpoint_hash: Optional[str] = None
+        self.class_mapping: Dict[int, str] = {0: "normal", 1: "violence"}
+        self.model_status_message: str = "Uninitialized"
         self._init_model()
 
+    @property
+    def architecture(self) -> str:
+        return self.config.architecture
+
+    def _compute_file_hash(self, file_path: str) -> str:
+        """Compute SHA-256 hash of checkpoint file."""
+        sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
     def _init_model(self) -> None:
-        """Initialize the deep neural network architecture and load weights."""
+        """Initialize the deep neural network architecture and load validated weights."""
         try:
             import torch
             import torch.nn as nn
@@ -46,14 +74,12 @@ class VideoActionClassifier:
                 weights = video_models.MC3_18_Weights.DEFAULT if self.config.pretrained else None
                 base_model = video_models.mc3_18(weights=weights)
             else:
-                # Default to factorized R(2+1)D-18
                 weights = video_models.R2Plus1D_18_Weights.DEFAULT if self.config.pretrained else None
                 base_model = video_models.r2plus1d_18(weights=weights)
 
             in_features = base_model.fc.in_features
 
             # SafeTV Violence Classification Head: [0: Normal Activity, 1: Potential Violence]
-            # Architecture matches SafeTVTrainer fine-tuning head exactly
             base_model.fc = nn.Sequential(
                 nn.Dropout(p=0.5),
                 nn.Linear(in_features, 128),
@@ -67,19 +93,26 @@ class VideoActionClassifier:
             self.model.to(self.device)
             self.model.eval()
 
-            # Attempt to automatically load trained checkpoint if specified and available
+            # Attempt to automatically load trained checkpoint
             checkpoint = getattr(self.config, "checkpoint_path", None)
             if checkpoint and os.path.exists(checkpoint):
                 self.load_checkpoint(checkpoint)
             else:
                 self.is_trained = False
+                self.is_ready = False
                 self.provenance = "uncalibrated_backbone"
+                self.model_status_message = (
+                    f"Trained checkpoint '{checkpoint}' not found. Model is in uncalibrated state."
+                )
+                logger.warning(self.model_status_message)
 
-        except ImportError:
-            # Fallback when torch is not available
+        except ImportError as e:
             self.model = None
             self.is_trained = False
-            self.provenance = "heuristic_fallback"
+            self.is_ready = False
+            self.provenance = "unavailable"
+            self.model_status_message = f"PyTorch / torchvision not installed: {e}"
+            logger.error(self.model_status_message)
 
     def _init_head_weights(self) -> None:
         """Initialize head linear layers with orthogonal weights."""
@@ -92,25 +125,79 @@ class VideoActionClassifier:
                         nn.init.constant_(module.bias, 0.0)
 
     def load_checkpoint(self, checkpoint_path: str) -> None:
-        """Load genuinely trained model weights from disk."""
+        """
+        Load genuinely trained model weights with strict integrity and key validation.
+        """
         import torch
         if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint not found at: {checkpoint_path}")
-        state = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(state)
-        self.model.eval()
-        self.is_trained = True
-        self.provenance = "trained"
-        self.loaded_checkpoint = checkpoint_path
+            self.is_trained = False
+            self.is_ready = False
+            self.provenance = "uncalibrated_backbone"
+            self.model_status_message = f"Checkpoint file not found: {checkpoint_path}"
+            raise FileNotFoundError(self.model_status_message)
+
+        # Compute SHA-256 hash for integrity tracking
+        self.checkpoint_hash = self._compute_file_hash(checkpoint_path)
+
+        # Attempt to load class mapping if present in checkpoint directory
+        ckpt_dir = os.path.dirname(checkpoint_path)
+        class_map_file = os.path.join(ckpt_dir, "class_mapping.json")
+        if os.path.exists(class_map_file):
+            try:
+                with open(class_map_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.class_mapping = {int(k): v for k, v in data.items()}
+            except Exception as e:
+                logger.warning(f"Could not parse class_mapping.json: {e}")
+
+        try:
+            # Safe loading with torch
+            state = torch.load(checkpoint_path, map_location=self.device)
+            if not isinstance(state, dict):
+                raise ValueError("Checkpoint is not a valid state dictionary.")
+
+            # Strict key verification
+            model_keys = set(self.model.state_dict().keys())
+            state_keys = set(state.keys())
+
+            missing_keys = model_keys - state_keys
+            unexpected_keys = state_keys - model_keys
+
+            if missing_keys or unexpected_keys:
+                err_msg = f"Checkpoint key mismatch! Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}"
+                logger.error(err_msg)
+                self.is_trained = False
+                self.is_ready = False
+                self.provenance = "corrupted_checkpoint"
+                self.model_status_message = err_msg
+                raise KeyError(err_msg)
+
+            self.model.load_state_dict(state, strict=True)
+            self.model.eval()
+
+            self.is_trained = True
+            self.is_ready = True
+            self.provenance = "trained"
+            self.loaded_checkpoint = checkpoint_path
+            self.model_status_message = f"Valid trained checkpoint loaded from {checkpoint_path} (SHA-256: {self.checkpoint_hash[:12]}...)"
+            logger.info(self.model_status_message)
+
+        except Exception as e:
+            self.is_trained = False
+            self.is_ready = False
+            self.provenance = "invalid_checkpoint"
+            self.model_status_message = f"Failed to load checkpoint: {e}"
+            logger.error(self.model_status_message)
+            raise ModelNotReadyError(self.model_status_message) from e
 
     def _extract_kinematic_flux(self, tensor_4d: np.ndarray) -> Tuple[float, float, float]:
         """
-        Extract physical spatiotemporal motion dynamics for diagnostic telemetry:
+        Extract physical spatiotemporal motion dynamics strictly for auxiliary telemetry:
         1. Velocity energy: ||dI/dt||^2
         2. Jerk / impact acceleration: ||d^2I/dt^2||^2
         3. Chaos ratio: Jerk / (Velocity + eps)
+        NOTE: These metrics are NEVER blended into the AI violence score.
         """
-        # tensor_4d shape: (C, T, H, W)
         v = np.diff(tensor_4d, axis=1)          # (C, T-1, H, W)
         a = np.diff(v, axis=1)                  # (C, T-2, H, W)
         v_energy = float(np.mean(np.square(v)))
@@ -118,14 +205,24 @@ class VideoActionClassifier:
         chaos_ratio = float(a_jerk / (v_energy + 1e-6))
         return v_energy, a_jerk, chaos_ratio
 
-    def predict_window(self, tensor_4d: np.ndarray) -> Dict[str, Union[float, str, bool, dict]]:
+    def predict_window(
+        self,
+        tensor_4d: np.ndarray,
+        allow_uncalibrated: bool = False
+    ) -> Dict[str, Union[float, str, bool, dict]]:
         """
         Run forward inference on a single spatiotemporal window (C, T, H, W).
-        Computes genuine AI violence probability without handcrafted heuristic blending.
-        Retains physical kinematic dynamics strictly as auxiliary telemetry.
+        Computes genuine AI violence probability via neural network softmax.
+        Raises ModelNotReadyError if model is not ready, preventing fake scores.
         """
         if tensor_4d.ndim != 4:
             raise ValueError(f"Expected 4D array of shape (C, T, H, W), got shape {tensor_4d.shape}")
+
+        if not self.is_ready:
+            if not allow_uncalibrated:
+                raise ModelNotReadyError(
+                    f"Model is not ready for violence prediction: {self.model_status_message}"
+                )
 
         v_energy, a_jerk, chaos_ratio = self._extract_kinematic_flux(tensor_4d)
 
@@ -137,7 +234,6 @@ class VideoActionClassifier:
                 logits = self.model(tensor_5d)
                 probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
 
-            # Genuine AI classification probabilities: [0: Normal, 1: Violence]
             normal_prob = float(probs[0])
             violence_prob = float(probs[1])
             label = "VIOLENCE" if violence_prob >= 0.50 else "NORMAL"
@@ -147,7 +243,9 @@ class VideoActionClassifier:
                 "normal_prob": normal_prob,
                 "predicted_label": label,
                 "is_trained": self.is_trained,
+                "is_ready": self.is_ready,
                 "provenance": self.provenance,
+                "checkpoint_hash": self.checkpoint_hash,
                 "motion_flux": {
                     "velocity_energy": round(v_energy, 4),
                     "jerk_acceleration": round(a_jerk, 4),
@@ -155,27 +253,15 @@ class VideoActionClassifier:
                 },
             }
         else:
-            # Fallback when PyTorch is not available: explicit heuristic diagnostics
-            kinematic_logit = (a_jerk * 3.5) + (v_energy * 2.0) - 3.2
-            violence_prob = float(np.clip(1.0 / (1.0 + np.exp(-kinematic_logit)), 0.0, 1.0))
-            normal_prob = 1.0 - violence_prob
-            label = "VIOLENCE" if violence_prob >= 0.50 else "NORMAL"
-            return {
-                "violence_prob": violence_prob,
-                "normal_prob": normal_prob,
-                "predicted_label": label,
-                "is_trained": False,
-                "provenance": "heuristic_fallback",
-                "motion_flux": {
-                    "velocity_energy": round(v_energy, 4),
-                    "jerk_acceleration": round(a_jerk, 4),
-                    "chaos_ratio": round(chaos_ratio, 4),
-                },
-            }
+            raise ModelNotReadyError("PyTorch neural network model is not available.")
 
-    def predict_batch(self, tensors: List[np.ndarray]) -> List[Dict[str, Union[float, str, bool, dict]]]:
+    def predict_batch(
+        self,
+        tensors: List[np.ndarray],
+        allow_uncalibrated: bool = False
+    ) -> List[Dict[str, Union[float, str, bool, dict]]]:
         """Run batch inference over a list of 4D spatiotemporal window arrays."""
         results = []
         for t in tensors:
-            results.append(self.predict_window(t))
+            results.append(self.predict_window(t, allow_uncalibrated=allow_uncalibrated))
         return results

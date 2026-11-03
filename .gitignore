@@ -49,6 +49,7 @@ uploads/
 # Video Data
 data/raw/
 data/processed/
+data/reviewed_export/
 !data/annotations/
 
 # IDEs

@@ -1,14 +1,16 @@
 """
 SafeTV Security Surveillance & Incident Response Server.
 Provides FastAPI REST API and Security Operations Center (SOC) Web Dashboard
-for video upload analysis, live webcam monitoring, RTSP CCTV multi-camera management,
+for video upload analysis, persistent webcam monitoring, RTSP CCTV multi-camera management,
 incident review, and automated alert dispatching.
+Enforces model integrity, path traversal protection, and human-in-the-loop review curation.
 """
 
 import base64
 import datetime
 import glob
 import json
+import logging
 import os
 import shutil
 import time
@@ -16,7 +18,7 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -26,8 +28,12 @@ from safetv.alerts import AlertConfig, AlertDispatcher
 from safetv.cctv import CameraConfig, CameraManager
 from safetv.config import SafeTVConfig
 from safetv.incident_classifier import Incident
+from safetv.model import ModelNotReadyError
 from safetv.pipeline import SafeTVPipeline
+from safetv.review import ReviewManager
+from safetv.webcam import WebcamSessionManager
 
+logger = logging.getLogger("safetv.server")
 
 app = FastAPI(
     title="SafeTV Surveillance & Incident Detection API",
@@ -43,7 +49,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Core pipeline and management subsystems
+# Core subsystems
 pipeline_config = SafeTVConfig()
 pipeline = SafeTVPipeline(pipeline_config)
 
@@ -53,25 +59,41 @@ camera_manager = CameraManager(
     pipeline_config=pipeline_config,
     alert_dispatcher=alert_dispatcher
 )
+webcam_session_manager = WebcamSessionManager(pipeline_config)
+review_manager = ReviewManager(reviews_file="evidence/reviews.json")
 
 UPLOAD_DIR = os.path.abspath("uploads")
 EVIDENCE_DIR = os.path.abspath("evidence")
-REVIEWS_FILE = os.path.join(EVIDENCE_DIR, "reviews.json")
+MAX_UPLOAD_BYTES = 250 * 1024 * 1024  # 250 MB
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(EVIDENCE_DIR, exist_ok=True)
 
 
+# Security & Authentication Helper
+def verify_api_key(x_api_key: Optional[str] = Header(None)) -> None:
+    """Verifies optional API key when configured in environment."""
+    required_key = os.getenv("SAFETV_API_KEY")
+    if required_key:
+        if not x_api_key or x_api_key != required_key:
+            raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing X-API-Key.")
+
+
 # Request Models
 class ReviewPayload(BaseModel):
-    status: str  # "CONFIRMED_VIOLENCE" or "FALSE_ALARM"
+    decision: Optional[str] = None  # TRUE_POSITIVE, FALSE_POSITIVE, UNCERTAIN
+    status: Optional[str] = None    # Backwards compatibility alias for decision
     reviewer_notes: Optional[str] = ""
     reviewer_name: Optional[str] = "Security Operator"
+
+    def get_decision(self) -> str:
+        return self.decision or self.status or "UNCERTAIN"
 
 
 class WebcamWindowPayload(BaseModel):
     frames_base64: List[str]
     fps: Optional[float] = 15.0
+    session_id: Optional[str] = None
 
 
 class CameraPayload(BaseModel):
@@ -83,26 +105,19 @@ class CameraPayload(BaseModel):
 
 
 def load_all_incidents() -> List[Dict]:
-    """Scan evidence directory and collect all recorded incident metadata."""
+    """Scan evidence directory and collect all recorded incident metadata with review state."""
     incidents = []
     meta_files = glob.glob(os.path.join(EVIDENCE_DIR, "*_metadata.json"))
-
-    reviews = {}
-    if os.path.exists(REVIEWS_FILE):
-        try:
-            with open(REVIEWS_FILE, "r", encoding="utf-8") as f:
-                reviews = json.load(f)
-        except Exception:
-            reviews = {}
 
     for mf in sorted(meta_files, key=os.path.getmtime, reverse=True):
         try:
             with open(mf, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 inc_id = str(data.get("incident_id"))
-                if inc_id in reviews:
-                    data["review"] = reviews[inc_id]
-                    data["status"] = reviews[inc_id].get("status", data.get("status"))
+                if inc_id in review_manager.reviews:
+                    rev = review_manager.reviews[inc_id]
+                    data["review"] = rev
+                    data["status"] = rev.get("decision", data.get("status"))
                 incidents.append(data)
         except Exception:
             continue
@@ -112,16 +127,22 @@ def load_all_incidents() -> List[Dict]:
 # REST API Endpoints
 @app.get("/api/status")
 async def get_system_status():
-    """Return AI engine status, model provenance, and hardware configuration."""
+    """Return AI engine status, model provenance, readiness, and hardware configuration."""
+    model_ready = pipeline.model.is_ready
     return {
         "status": "ONLINE",
         "version": __version__,
+        "model_status": "MODEL_READY" if model_ready else "MODEL_NOT_READY",
         "model": {
             "architecture": pipeline.config.model.architecture,
             "is_trained": pipeline.model.is_trained,
+            "is_ready": model_ready,
             "provenance": pipeline.model.provenance,
             "checkpoint": pipeline.model.loaded_checkpoint,
+            "checkpoint_hash": pipeline.model.checkpoint_hash,
+            "class_mapping": pipeline.model.class_mapping,
             "device": str(pipeline.model.device),
+            "status_message": pipeline.model.model_status_message,
         },
         "thresholds": {
             "onset_threshold": pipeline.config.incident.onset_threshold,
@@ -149,55 +170,83 @@ async def upload_and_analyze_video(file: UploadFile = File(...)):
     if ext not in valid_exts:
         raise HTTPException(status_code=400, detail=f"Unsupported video format: {ext}")
 
-    safe_name = f"{int(time.time())}_{file.filename}"
+    safe_name = f"{int(time.time())}_{os.path.basename(file.filename)}"
     temp_path = os.path.join(UPLOAD_DIR, safe_name)
 
     try:
+        written_bytes = 0
         with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            while chunk := await file.read(65536):
+                written_bytes += len(chunk)
+                if written_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail=f"File exceeds maximum upload size of {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
+                buffer.write(chunk)
 
         report = pipeline.process_file(temp_path)
         report_dict = report.to_dict()
 
-        for inc_dict in report_dict.get("incidents", []):
-            if inc_dict.get("evidence_path"):
-                inc_dict["evidence_filename"] = os.path.basename(inc_dict["evidence_path"])
+        if pipeline.model.is_ready:
+            for inc_dict in report_dict.get("incidents", []):
+                if inc_dict.get("evidence_path"):
+                    inc_dict["evidence_filename"] = os.path.basename(inc_dict["evidence_path"])
 
-            # Dispatch notification
-            temp_inc = Incident(
-                incident_id=inc_dict["incident_id"],
-                start_time_sec=inc_dict["start_time_sec"],
-                end_time_sec=inc_dict["end_time_sec"],
-                duration_sec=inc_dict["duration_sec"],
-                start_frame=inc_dict["start_frame"],
-                end_frame=inc_dict["end_frame"],
-                peak_probability=inc_dict["peak_probability"],
-                mean_probability=inc_dict["mean_probability"],
-                severity=inc_dict["severity"],
-                evidence_path=inc_dict.get("evidence_path"),
-            )
-            alert_dispatcher.dispatch_incident_alert(
-                incident=temp_inc,
-                camera_id="upload_feed",
-                camera_name=file.filename
-            )
+                temp_inc = Incident(
+                    incident_id=inc_dict["incident_id"],
+                    start_time_sec=inc_dict["start_time_sec"],
+                    end_time_sec=inc_dict["end_time_sec"],
+                    duration_sec=inc_dict["duration_sec"],
+                    start_frame=inc_dict["start_frame"],
+                    end_frame=inc_dict["end_frame"],
+                    peak_probability=inc_dict["peak_probability"],
+                    mean_probability=inc_dict["mean_probability"],
+                    severity=inc_dict["severity"],
+                    evidence_path=inc_dict.get("evidence_path"),
+                )
+                alert_dispatcher.dispatch_incident_alert(
+                    incident=temp_inc,
+                    camera_id="upload_feed",
+                    camera_name=file.filename
+                )
 
         return {
             "success": True,
             "filename": file.filename,
+            "model_ready": pipeline.model.is_ready,
             "report": report_dict,
         }
     finally:
         pass
 
 
+# Persistent Webcam Session Endpoints
+@app.post("/api/webcam/session/start")
+async def start_webcam_session():
+    """Start a stateful continuous webcam monitoring session."""
+    session_id = webcam_session_manager.create_session()
+    return {"success": True, "session_id": session_id}
+
+
+@app.post("/api/webcam/session/stop")
+async def stop_webcam_session(payload: dict):
+    """Stop session and finalize any concluding incidents."""
+    session_id = payload.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required.")
+    final_incidents = webcam_session_manager.close_session(session_id)
+    return {
+        "success": True,
+        "final_incidents": [inc.to_dict() for inc in final_incidents]
+    }
+
+
 @app.post("/api/analyze/stream-window")
 async def analyze_stream_window(payload: WebcamWindowPayload):
     """
     Process rolling temporal window frames sent by the live laptop webcam.
+    Preserves stateful smoothing and incident detection across batches.
     """
-    if len(payload.frames_base64) < 8:
-        raise HTTPException(status_code=400, detail="Insufficient frames for window inference (min 8 required).")
+    if len(payload.frames_base64) < 4:
+        raise HTTPException(status_code=400, detail="Insufficient frames for window inference.")
 
     decoded_frames = []
     for b64 in payload.frames_base64:
@@ -213,20 +262,33 @@ async def analyze_stream_window(payload: WebcamWindowPayload):
     if not decoded_frames:
         raise HTTPException(status_code=400, detail="Failed to decode video frames.")
 
-    report = pipeline.process_frames(decoded_frames, fps=payload.fps, source_name="live_webcam")
-    report_dict = report.to_dict()
+    # Use persistent session to prevent state wipe between chunked requests
+    session = webcam_session_manager.get_or_create_session(payload.session_id)
+    prob, is_active, completed_incidents = session.add_frames_and_infer(decoded_frames, fps=payload.fps or 15.0)
 
-    for inc in report_dict.get("incidents", []):
-        if inc.get("evidence_path"):
-            inc["evidence_filename"] = os.path.basename(inc["evidence_path"])
+    incidents_dicts = []
+    for inc in completed_incidents:
+        d = inc.to_dict()
+        if inc.evidence_path:
+            d["evidence_filename"] = os.path.basename(inc.evidence_path)
+        incidents_dicts.append(d)
+
+        # Dispatch real-time alert for confirmed webcam incident
+        alert_dispatcher.dispatch_incident_alert(
+            incident=inc,
+            camera_id="webcam_live",
+            camera_name="Laptop Webcam Feed"
+        )
 
     return {
         "success": True,
-        "smoothed_violence_prob": report.peak_violence_prob,
-        "is_incident_active": pipeline.incident_classifier.is_incident_active,
-        "incidents_detected": report.incidents_detected,
-        "incidents": report_dict.get("incidents", []),
+        "session_id": session.session_id,
+        "smoothed_violence_prob": prob,
+        "is_incident_active": is_active,
+        "incidents_detected": len(incidents_dicts),
+        "incidents": incidents_dicts,
         "is_model_trained": pipeline.model.is_trained,
+        "is_model_ready": pipeline.model.is_ready,
         "provenance": pipeline.model.provenance,
     }
 
@@ -313,39 +375,45 @@ async def list_incidents():
 
 @app.get("/api/evidence/{filename}")
 async def get_evidence_clip(filename: str):
-    """Stream forensic MP4 evidence video clip for browser playback."""
-    file_path = os.path.join(EVIDENCE_DIR, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Evidence clip not found.")
-    return FileResponse(file_path, media_type="video/mp4", filename=filename)
+    """
+    Stream forensic MP4 evidence video clip for browser playback.
+    Strict path-traversal prevention: restricts access exclusively inside EVIDENCE_DIR.
+    """
+    safe_filename = os.path.basename(filename)
+    target_path = os.path.abspath(os.path.join(EVIDENCE_DIR, safe_filename))
+
+    if not target_path.startswith(EVIDENCE_DIR) or not os.path.exists(target_path):
+        raise HTTPException(status_code=404, detail="Evidence clip not found or access denied.")
+
+    return FileResponse(target_path, media_type="video/mp4", filename=safe_filename)
 
 
 @app.post("/api/incidents/{incident_id}/review")
 async def review_incident(incident_id: str, payload: ReviewPayload):
-    """Log security operator verification / false-alarm feedback."""
-    reviews = {}
-    if os.path.exists(REVIEWS_FILE):
-        try:
-            with open(REVIEWS_FILE, "r", encoding="utf-8") as f:
-                reviews = json.load(f)
-        except Exception:
-            reviews = {}
-
-    reviews[incident_id] = {
-        "status": payload.status,
-        "reviewer_notes": payload.reviewer_notes,
-        "reviewer_name": payload.reviewer_name,
-        "reviewed_at": datetime.datetime.now().isoformat(),
-    }
-
-    with open(REVIEWS_FILE, "w", encoding="utf-8") as f:
-        json.dump(reviews, f, indent=2)
-
+    """Log security operator verification decision (TRUE_POSITIVE, FALSE_POSITIVE, UNCERTAIN)."""
+    record = review_manager.log_review(
+        incident_id=incident_id,
+        decision_raw=payload.get_decision(),
+        reviewer_notes=payload.reviewer_notes or "",
+        reviewer_name=payload.reviewer_name or "Security Operator",
+        model_version=__version__,
+        checkpoint_hash=pipeline.model.checkpoint_hash,
+    )
     return {
         "success": True,
         "incident_id": incident_id,
-        "status": payload.status,
+        "review": record.to_dict(),
     }
+
+
+@app.post("/api/incidents/export-dataset")
+async def export_reviewed_dataset():
+    """
+    Export human-reviewed incidents (TRUE_POSITIVE vs FALSE_POSITIVE) into a curated dataset
+    directory for future model retraining cycles.
+    """
+    summary = review_manager.export_reviewed_dataset(evidence_dir=EVIDENCE_DIR)
+    return {"success": True, "export_summary": summary}
 
 
 # SOC Web Dashboard
@@ -378,7 +446,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div>
         <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-2">
           SafeTV
-          <span class="text-xs font-semibold px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+          <span id="prodBadge" class="text-xs font-semibold px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
             PROD ENGINE
           </span>
         </h1>
@@ -389,7 +457,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <!-- Navigation Bar -->
     <div class="flex items-center space-x-3">
       <div id="modelPill" class="flex items-center space-x-2 text-xs px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700">
-        <span class="h-2 w-2 rounded-full bg-emerald-500 animate-ping"></span>
+        <span id="modelDot" class="h-2 w-2 rounded-full bg-emerald-500 animate-ping"></span>
         <span class="text-slate-300">Model: <strong id="modelArchText" class="text-white">R(2+1)D-18 (TRAINED)</strong></span>
       </div>
       <button onclick="switchTab('uploadTab')" id="tabBtnUpload" class="px-3 py-1.5 rounded-lg text-sm font-medium bg-red-600 text-white shadow">
@@ -411,12 +479,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </header>
 
+  <!-- Model Not Ready Banner -->
+  <div id="modelNotReadyBanner" class="hidden border-b border-amber-500/50 bg-amber-950/70 px-6 py-2 text-center text-amber-200 font-semibold text-xs flex items-center justify-center gap-2">
+    <span>⚠️ WARNING: Model is in MODEL_NOT_READY state. Valid trained checkpoint not loaded. Automated incident alerting is disabled.</span>
+  </div>
+
   <!-- Live Alert Banner -->
   <div id="liveAlertBanner" class="hidden alert-pulse border-b border-red-500/50 bg-red-950/60 px-6 py-2.5 text-center text-red-200 font-semibold text-sm flex items-center justify-center gap-2">
     <svg class="h-5 w-5 text-red-400 animate-bounce" fill="none" viewBox="0 0 24 24" stroke="currentColor">
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
     </svg>
-    <span>CRITICAL SAFETY ALERT: Potential physical altercation detected in active surveillance feed!</span>
+    <span>Potential physical violence detected — human verification required.</span>
   </div>
 
   <!-- Main Content Area -->
@@ -519,7 +592,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="flex items-center justify-between mb-4">
             <div>
               <h2 class="text-base font-semibold text-white">Live Camera Safety Feed</h2>
-              <p class="text-xs text-slate-400">Processes rolling spatiotemporal windows in real-time from webcam.</p>
+              <p class="text-xs text-slate-400">Processes continuous rolling spatiotemporal windows in real-time from webcam.</p>
             </div>
             <button onclick="toggleWebcam()" id="webcamToggleBtn" class="px-4 py-1.5 rounded-lg text-sm font-semibold bg-emerald-600 hover:bg-emerald-500 text-white transition shadow">
               Start Camera
@@ -562,7 +635,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="p-4 rounded-lg bg-slate-950 border border-slate-800 space-y-2 text-xs">
             <div class="flex justify-between">
               <span class="text-slate-400">Inference Engine:</span>
-              <span class="text-slate-200 font-mono">R(2+1)D-18 (Fine-Tuned)</span>
+              <span class="text-slate-200 font-mono">R(2+1)D-18</span>
             </div>
             <div class="flex justify-between">
               <span class="text-slate-400">Window Size:</span>
@@ -598,7 +671,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
 
         <div id="cctvGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          <!-- Dynamically populated camera cards -->
         </div>
       </div>
     </div>
@@ -609,11 +681,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="flex items-center justify-between mb-4">
           <div>
             <h2 class="text-base font-semibold text-white">Incident Evidence Vault</h2>
-            <p class="text-xs text-slate-400">Forensic archive of all detected safety altercations.</p>
+            <p class="text-xs text-slate-400">Forensic archive of detected safety altercations with human verification curation.</p>
           </div>
-          <button onclick="refreshIncidents()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition">
-            Refresh Vault
-          </button>
+          <div class="flex gap-2">
+            <button onclick="exportReviewedDataset()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-700 hover:bg-red-600 text-white border border-red-600 transition">
+              Export Curated Dataset
+            </button>
+            <button onclick="refreshIncidents()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition">
+              Refresh Vault
+            </button>
+          </div>
         </div>
 
         <div id="vaultTableContainer" class="overflow-x-auto">
@@ -625,7 +702,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <th class="py-3 px-4">Timestamp Window</th>
                 <th class="py-3 px-4">Peak Confidence</th>
                 <th class="py-3 px-4">Severity</th>
-                <th class="py-3 px-4">Status</th>
+                <th class="py-3 px-4">Human Verification</th>
                 <th class="py-3 px-4 text-right">Actions</th>
               </tr>
             </thead>
@@ -658,14 +735,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
 
         <div id="alertsList" class="space-y-3">
-          <!-- Populated dynamically -->
         </div>
       </div>
     </div>
 
   </main>
 
-  <!-- Evidence Playback & Review Modal -->
+  <!-- Evidence Playback & Human Review Modal -->
   <div id="evidenceModal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
     <div class="bg-slate-900 border border-slate-700 rounded-xl max-w-2xl w-full p-6 space-y-4 shadow-2xl">
       <div class="flex justify-between items-center border-b border-slate-800 pb-3">
@@ -685,16 +761,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <div class="space-y-2">
-        <label class="text-xs text-slate-400 block font-semibold">Operator Verification Notes:</label>
-        <textarea id="modalNotes" rows="2" class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-red-500" placeholder="Optional security notes..."></textarea>
+        <label class="text-xs text-slate-400 block font-semibold">Security Operator Verification Decision:</label>
+        <div class="flex gap-4 text-xs">
+          <label class="flex items-center gap-1.5 cursor-pointer">
+            <input type="radio" name="reviewDecision" value="TRUE_POSITIVE" checked class="text-red-600 focus:ring-0">
+            <span class="text-red-400 font-semibold">TRUE_POSITIVE (Genuine Violence)</span>
+          </label>
+          <label class="flex items-center gap-1.5 cursor-pointer">
+            <input type="radio" name="reviewDecision" value="FALSE_POSITIVE" class="text-emerald-600 focus:ring-0">
+            <span class="text-emerald-400 font-semibold">FALSE_POSITIVE (Normal/Benign)</span>
+          </label>
+          <label class="flex items-center gap-1.5 cursor-pointer">
+            <input type="radio" name="reviewDecision" value="UNCERTAIN" class="text-amber-600 focus:ring-0">
+            <span class="text-amber-400 font-semibold">UNCERTAIN</span>
+          </label>
+        </div>
+        <textarea id="modalNotes" rows="2" class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-red-500" placeholder="Operator notes and escalation context..."></textarea>
       </div>
 
       <div class="flex justify-end gap-3 pt-2">
-        <button onclick="submitReview('FALSE_ALARM')" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition">
-          Mark False Alarm
+        <button onclick="closeModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition">
+          Cancel
         </button>
-        <button onclick="submitReview('CONFIRMED_VIOLENCE')" class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-xs font-semibold transition shadow">
-          Confirm Incident & Escalate
+        <button onclick="submitReviewFromModal()" class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-xs font-semibold transition shadow">
+          Submit Human Verification
         </button>
       </div>
     </div>
@@ -743,6 +833,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     let webcamStream = null;
     let webcamInterval = null;
     let isWebcamRunning = false;
+    let activeWebcamSessionId = null;
     let capturedFramesBuffer = [];
 
     function switchTab(tabId) {
@@ -836,7 +927,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         clearInterval(interval);
         progress.classList.add('hidden');
         analyzeBtn.disabled = false;
-        alert('Network or server error during analysis: ' + err.message);
+        alert('Error during video upload/analysis: ' + err.message);
       }
     }
 
@@ -918,14 +1009,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       activeModalIncidentId = null;
     }
 
-    async function submitReview(status) {
+    async function submitReviewFromModal() {
       if (!activeModalIncidentId) return;
+      const decision = document.querySelector('input[name="reviewDecision"]:checked').value;
       const notes = document.getElementById('modalNotes').value;
       try {
         await fetch(`/api/incidents/${activeModalIncidentId}/review`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status, reviewer_notes: notes }),
+          body: JSON.stringify({ decision, reviewer_notes: notes }),
         });
         closeModal();
         refreshIncidents();
@@ -934,7 +1026,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    // Live Webcam Implementation
+    async function exportReviewedDataset() {
+      try {
+        const resp = await fetch('/api/incidents/export-dataset', { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+          const s = data.export_summary;
+          alert(`Successfully exported ${s.total_exported} reviewed incidents to:\n${s.target_dir}\n\nViolence: ${s.exported_counts.violence}\nNon-Violence: ${s.exported_counts.non_violence}`);
+        }
+      } catch (err) {
+        alert('Failed to export dataset: ' + err.message);
+      }
+    }
+
+    // Persistent Live Webcam Implementation
     async function toggleWebcam() {
       if (isWebcamRunning) {
         stopWebcam();
@@ -946,6 +1051,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     async function startWebcam() {
       const vid = document.getElementById('webcamVideo');
       try {
+        // Start backend persistent session
+        const sessionResp = await fetch('/api/webcam/session/start', { method: 'POST' });
+        const sessionData = await sessionResp.json();
+        activeWebcamSessionId = sessionData.session_id;
+
         webcamStream = await navigator.mediaDevices.getUserMedia({
           video: { width: 320, height: 240, frameRate: { ideal: 15 } },
           audio: false
@@ -970,22 +1080,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const b64 = canvas.toDataURL('image/jpeg', 0.6);
           capturedFramesBuffer.push(b64);
 
-          if (capturedFramesBuffer.length >= 16) {
-            const windowToSend = capturedFramesBuffer.slice(-16);
-            capturedFramesBuffer = capturedFramesBuffer.slice(-8);
+          // Stream batch to persistent session every 8 frames
+          if (capturedFramesBuffer.length >= 8) {
+            const batch = capturedFramesBuffer.slice();
+            capturedFramesBuffer = [];
 
             try {
               const resp = await fetch('/api/analyze/stream-window', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ frames_base64: windowToSend, fps: 15.0 })
+                body: JSON.stringify({
+                  frames_base64: batch,
+                  fps: 15.0,
+                  session_id: activeWebcamSessionId
+                })
               });
               const resData = await resp.json();
               if (resData.success) {
                 updateLiveHUD(resData);
               }
             } catch (e) {
-              console.error('Webcam window inference error:', e);
+              console.error('Webcam stream error:', e);
             }
           }
         }, 120);
@@ -995,12 +1110,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    function stopWebcam() {
+    async function stopWebcam() {
       if (webcamStream) {
         webcamStream.getTracks().forEach(t => t.stop());
       }
       clearInterval(webcamInterval);
       isWebcamRunning = false;
+
+      if (activeWebcamSessionId) {
+        try {
+          await fetch('/api/webcam/session/stop', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: activeWebcamSessionId })
+          });
+        } catch (e) {}
+        activeWebcamSessionId = null;
+      }
+
       document.getElementById('webcamVideo').classList.add('hidden');
       document.getElementById('webcamPlaceholder').classList.remove('hidden');
       document.getElementById('webcamHUD').classList.add('hidden');
@@ -1221,8 +1348,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const clipName = inc.evidence_clip.clip_path.split(/[\\\\/]/).pop();
 
           let statusClass = 'bg-amber-500/20 text-amber-400 border border-amber-500/30';
-          if (inc.status === 'CONFIRMED_VIOLENCE') statusClass = 'bg-red-500/20 text-red-400 border border-red-500/30';
-          if (inc.status === 'FALSE_ALARM') statusClass = 'bg-slate-500/20 text-slate-400 border border-slate-500/30';
+          if (inc.status === 'TRUE_POSITIVE' || inc.status === 'CONFIRMED_VIOLENCE') statusClass = 'bg-red-500/20 text-red-400 border border-red-500/30';
+          if (inc.status === 'FALSE_POSITIVE' || inc.status === 'FALSE_ALARM') statusClass = 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
 
           tr.innerHTML = `
             <td class="py-3 px-4 font-mono font-bold text-white">#${inc.incident_id}</td>
@@ -1244,7 +1371,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    // Check system status on page load
+    async function checkSystemStatus() {
+      try {
+        const resp = await fetch('/api/status');
+        const data = await resp.json();
+        if (data.model_status === 'MODEL_NOT_READY') {
+          document.getElementById('modelNotReadyBanner').classList.remove('hidden');
+          document.getElementById('modelArchText').textContent = 'NOT READY';
+          document.getElementById('modelDot').className = 'h-2 w-2 rounded-full bg-red-500';
+          document.getElementById('prodBadge').className = 'text-xs font-semibold px-2 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20';
+          document.getElementById('prodBadge').textContent = 'UNAVAILABLE';
+        } else {
+          const hashShort = data.model.checkpoint_hash ? ` [${data.model.checkpoint_hash.substring(0, 7)}]` : '';
+          document.getElementById('modelArchText').textContent = `${data.model.architecture.toUpperCase()} (TRAINED)${hashShort}`;
+        }
+      } catch (e) {}
+    }
+
     document.addEventListener('DOMContentLoaded', () => {
+      checkSystemStatus();
       refreshIncidents();
     });
   </script>
@@ -1264,8 +1410,8 @@ def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
     import uvicorn
     print("=" * 65)
     print(f" SafeTV Surveillance Web Server starting on http://{host}:{port}")
-    print(f" AI Model: {pipeline.config.model.architecture} (Trained: {pipeline.model.is_trained})")
-    print(f" Multi-Camera Engine & Alert Dispatcher: ACTIVE")
+    print(f" Model Architecture: {pipeline.config.model.architecture} | Trained: {pipeline.model.is_trained} | Ready: {pipeline.model.is_ready}")
+    print(f" Checkpoint SHA-256: {pipeline.model.checkpoint_hash}")
     print("=" * 65)
     uvicorn.run(app, host=host, port=port)
 

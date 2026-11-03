@@ -10,7 +10,8 @@ import time
 import unittest
 
 from safetv.alerts import AlertConfig, AlertDispatcher
-from safetv.cctv import CameraConfig, CameraManager, RTSPStreamWorker
+from safetv.cctv import BufferedFrame, CameraConfig, CameraManager, RTSPStreamWorker
+from safetv.incident_classifier import Incident
 
 
 class TestCCTVEngine(unittest.TestCase):
@@ -75,6 +76,21 @@ class TestCCTVEngine(unittest.TestCase):
         stopped = self.manager.stop_camera("cam_test_worker")
         self.assertTrue(stopped)
         self.assertEqual(self.manager.workers["cam_test_worker"].status, "STOPPED")
+
+    def test_buffered_frame_timestamp_consistency(self):
+        """Validates that BufferedFrame holds video-relative and monotonic timestamps accurately."""
+        dummy_rgb = (100 * (None or 1)).to_bytes(0, 'big') if False else None
+        b_frame = BufferedFrame(
+            frame_index=150,
+            video_sec=5.0, # 150 frames @ 30 FPS = 5.0 seconds
+            monotonic_sec=1024.5,
+            wall_clock_iso="2026-11-03T11:00:00Z",
+            rgb_frame=dummy_rgb,
+        )
+        self.assertEqual(b_frame.frame_index, 150)
+        self.assertEqual(b_frame.video_sec, 5.0)
+        self.assertEqual(b_frame.monotonic_sec, 1024.5)
+        self.assertEqual(b_frame.wall_clock_iso, "2026-11-03T11:00:00Z")
 
 
 if __name__ == "__main__":

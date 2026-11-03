@@ -2,6 +2,7 @@
 SafeTV CCTV & Multi-Camera Ingestion Engine.
 Manages persistent threaded workers for RTSP / HTTP surveillance camera feeds,
 rolling spatiotemporal frame buffers, automated reconnection, and real-time alert dispatching.
+Enforces a consistent timestamp model (camera-relative seconds + wall-clock capture).
 """
 
 import collections
@@ -12,7 +13,7 @@ import os
 import threading
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -21,11 +22,21 @@ from safetv.alerts import AlertDispatcher
 from safetv.config import SafeTVConfig
 from safetv.evidence import EvidenceExtractor
 from safetv.incident_classifier import Incident, IncidentClassifier
-from safetv.model import VideoActionClassifier
+from safetv.model import ModelNotReadyError, VideoActionClassifier
 from safetv.temporal_smoothing import TemporalSmoother
 from safetv.video_loader import VideoWindowExtractor
 
 logger = logging.getLogger("safetv.cctv")
+
+
+@dataclass
+class BufferedFrame:
+    """Frame structure with synchronized timestamp metadata."""
+    frame_index: int
+    video_sec: float              # Camera-relative seconds since session start
+    monotonic_sec: float          # Local monotonic clock
+    wall_clock_iso: str           # ISO 8601 wall-clock capture time
+    rgb_frame: np.ndarray
 
 
 @dataclass
@@ -37,7 +48,7 @@ class CameraConfig:
     source_url: str                     # RTSP URL (e.g. rtsp://192.168.1.50:554/live) or local video path
     enabled: bool = True
     target_fps: float = 15.0
-    buffer_seconds: float = 6.0         # Duration of rolling in-memory frame ring buffer
+    buffer_seconds: float = 8.0         # Duration of rolling in-memory frame ring buffer (>= pre + post buffers)
     reconnect_interval_sec: float = 3.0 # Interval before retrying a dropped connection
 
     def to_dict(self) -> dict:
@@ -73,9 +84,12 @@ class RTSPStreamWorker:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
-        # Rolling frame ring buffer: stores (timestamp, rgb_frame)
-        buffer_len = max(60, int(self.camera.target_fps * self.camera.buffer_seconds))
-        self._frame_buffer: collections.deque = collections.deque(maxlen=buffer_len)
+        # Rolling frame ring buffer: stores BufferedFrame
+        buffer_len = max(90, int(self.camera.target_fps * self.camera.buffer_seconds))
+        self._frame_buffer: collections.deque[BufferedFrame] = collections.deque(maxlen=buffer_len)
+
+        # Pending incident post-buffer queue
+        self._pending_evidence_incidents: List[Tuple[Incident, float]] = []
 
         # Telemetry
         self.status = "STOPPED"  # STOPPED, CONNECTING, RUNNING, RECONNECTING, ERROR
@@ -85,6 +99,8 @@ class RTSPStreamWorker:
         self.incidents_detected_count = 0
         self.last_error: Optional[str] = None
         self.last_frame_time: Optional[float] = None
+        self.session_start_time: Optional[float] = None
+        self.session_frame_count: int = 0
 
     def start(self) -> None:
         """Start the camera ingestion and AI monitoring thread."""
@@ -118,45 +134,63 @@ class RTSPStreamWorker:
 
                 self.status = "RUNNING"
                 self.last_error = None
-                frame_count = 0
-                start_clock = time.time()
-                last_window_time = time.time()
+                self.session_start_time = time.monotonic()
+                self.session_frame_count = 0
+                self.incident_classifier.reset()
+                self.smoother.reset()
 
-                # Inference window accumulation buffer
-                window_frames = []
+                fps_stream = cap.get(cv2.CAP_PROP_FPS)
+                target_fps = fps_stream if (fps_stream and fps_stream > 0 and not np.isnan(fps_stream)) else self.camera.target_fps
+
+                start_clock = time.time()
+                sec_counter = 0
+
+                window_frames: List[np.ndarray] = []
 
                 while not self._stop_event.is_set():
                     ret, bgr = cap.read()
                     if not ret:
-                        # Video ended (if file) or network dropped (if RTSP)
                         break
 
-                    now = time.time()
+                    now_mono = time.monotonic()
+                    now_wall = datetime.datetime.now().isoformat()
+                    video_sec = self.session_frame_count / target_fps
+
                     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    b_frame = BufferedFrame(
+                        frame_index=self.session_frame_count,
+                        video_sec=video_sec,
+                        monotonic_sec=now_mono,
+                        wall_clock_iso=now_wall,
+                        rgb_frame=rgb,
+                    )
+
                     with self._lock:
-                        self._frame_buffer.append((now, rgb))
-                        self.last_frame_time = now
+                        self._frame_buffer.append(b_frame)
+                        self.last_frame_time = time.time()
 
                     window_frames.append(rgb)
-                    frame_count += 1
+                    self.session_frame_count += 1
+                    sec_counter += 1
 
                     # Compute rolling actual FPS
-                    elapsed = now - start_clock
+                    elapsed = time.time() - start_clock
                     if elapsed >= 1.0:
-                        self.fps_actual = round(frame_count / elapsed, 1)
-                        frame_count = 0
-                        start_clock = now
+                        self.fps_actual = round(sec_counter / elapsed, 1)
+                        sec_counter = 0
+                        start_clock = time.time()
 
                     # Process window every window_step frames
                     required_span = (self.config.extraction.window_size - 1) * self.config.extraction.temporal_stride + 1
                     if len(window_frames) >= required_span:
-                        self._process_accumulated_window(window_frames)
-                        # Slide forward by window_step
+                        self._process_accumulated_window(window_frames, video_sec, self.session_frame_count)
                         step = max(1, self.config.extraction.window_step)
                         window_frames = window_frames[step:]
 
-                    # Throttle to target FPS
-                    time.sleep(max(0.001, 1.0 / self.camera.target_fps - 0.005))
+                    # Check pending evidence clips for post-buffer readiness
+                    self._check_pending_evidence(video_sec, target_fps)
+
+                    time.sleep(max(0.001, 1.0 / target_fps - 0.005))
 
             except Exception as e:
                 self.last_error = str(e)
@@ -171,18 +205,18 @@ class RTSPStreamWorker:
 
         self.status = "STOPPED"
 
-    def _process_accumulated_window(self, frames_list: List[np.ndarray]) -> None:
+    def _process_accumulated_window(self, frames_list: List[np.ndarray], current_video_sec: float, current_frame_idx: int) -> None:
         """Extract spatiotemporal window tensor, perform AI inference, and update incident tracker."""
+        if not self.model.is_ready:
+            return
+
         try:
-            # Subsample frames according to temporal stride
             stride = self.config.extraction.temporal_stride
             size = self.config.extraction.window_size
             sampled = [frames_list[i * stride] for i in range(size)]
 
-            # Convert to normalized 4D tensor
             tensor_4d = self.extractor._resize_and_normalize(sampled)
 
-            # Deep AI inference
             preds = self.model.predict_window(tensor_4d)
             raw_prob = float(preds["violence_prob"])
             smoothed_prob = self.smoother.update(raw_prob)
@@ -192,39 +226,65 @@ class RTSPStreamWorker:
                 if smoothed_prob > self.peak_prob:
                     self.peak_prob = round(smoothed_prob, 4)
 
-            now_sec = time.time()
+            # Pass video-relative timestamp to maintain unified timeline
             completed_incident = self.incident_classifier.process_window(
                 smoothed_prob=smoothed_prob,
-                timestamp_sec=now_sec,
-                frame_idx=0
+                timestamp_sec=current_video_sec,
+                frame_idx=current_frame_idx
             )
 
             if completed_incident is not None:
-                self._handle_completed_incident(completed_incident)
+                self.incidents_detected_count += 1
+                logger.warning(
+                    f" [!] INCIDENT #{completed_incident.incident_id} DETECTED on camera '{self.camera.name}'! "
+                    f"({completed_incident.start_time_sec:.2f}s - {completed_incident.end_time_sec:.2f}s, "
+                    f"Peak: {completed_incident.peak_probability * 100:.1f}%)"
+                )
+                # Queue incident for evidence extraction once post-buffer has arrived
+                post_target_sec = completed_incident.end_time_sec + self.config.evidence.post_buffer_sec
+                with self._lock:
+                    self._pending_evidence_incidents.append((completed_incident, post_target_sec))
 
         except Exception as e:
             logger.error(f"Window processing error on camera {self.camera.camera_id}: {e}")
 
-    def _handle_completed_incident(self, incident: Incident) -> None:
-        """Slice evidence video from ring buffer and dispatch notification."""
-        self.incidents_detected_count += 1
-        logger.warning(f" [!] INCIDENT #{incident.incident_id} DETECTED on camera '{self.camera.name}'! (Peak: {incident.peak_probability * 100:.1f}%)")
-
-        # Snapshot buffered frames for evidence clip
+    def _check_pending_evidence(self, current_video_sec: float, fps: float) -> None:
+        """Check if post-buffer is available for pending incidents, then slice clip and alert."""
+        ready_incidents = []
         with self._lock:
-            buffered_snapshots = [f[1] for f in self._frame_buffer]
+            remaining = []
+            for inc, target_sec in self._pending_evidence_incidents:
+                if current_video_sec >= target_sec:
+                    ready_incidents.append(inc)
+                else:
+                    remaining.append((inc, target_sec))
+            self._pending_evidence_incidents = remaining
 
-        if buffered_snapshots and self.config.evidence.save_evidence_clips:
-            # Slices MP4 clip and metadata JSON
+        for inc in ready_incidents:
+            self._slice_and_dispatch_incident(inc, fps)
+
+    def _slice_and_dispatch_incident(self, incident: Incident, fps: float) -> None:
+        """Extract buffered evidence frames matching camera-relative interval."""
+        pre_buf = self.config.evidence.pre_buffer_sec
+        post_buf = self.config.evidence.post_buffer_sec
+        t_start = max(0.0, incident.start_time_sec - pre_buf)
+        t_end = incident.end_time_sec + post_buf
+
+        with self._lock:
+            matched_frames = [
+                f.rgb_frame for f in self._frame_buffer
+                if t_start <= f.video_sec <= t_end
+            ]
+
+        if matched_frames and self.config.evidence.save_evidence_clips:
             clip_path = self.evidence_extractor.extract_clip_from_frames(
-                frames=buffered_snapshots,
-                fps=self.fps_actual if self.fps_actual > 0 else self.camera.target_fps,
+                frames=matched_frames,
+                fps=fps,
                 incident=incident,
                 source_name=self.camera.name
             )
             incident.evidence_path = clip_path
 
-        # Dispatch real-time alert via Webhook / Email / Audit log
         if self.alert_dispatcher:
             self.alert_dispatcher.dispatch_incident_alert(
                 incident=incident,

@@ -132,6 +132,12 @@ class TestIncidentClassifier(unittest.TestCase):
         self.assertIsNotNone(completed)
         self.assertAlmostEqual(completed.peak_probability, 0.90, places=2)
         self.assertEqual(completed.severity, "CRITICAL")
+        # Key bug fix verifications:
+        self.assertAlmostEqual(completed.start_time_sec, 2.0, places=2, msg="Start time must match the FIRST qualifying onset window")
+        self.assertAlmostEqual(completed.end_time_sec, 3.0, places=2, msg="End time must match the last qualifying active window")
+        self.assertAlmostEqual(completed.duration_sec, 1.0, places=2, msg="Duration must exclude cooling-off period")
+        self.assertEqual(completed.start_frame, 60)
+        self.assertEqual(completed.end_frame, 90)
 
 
 class TestNormalVsViolenceDiscrimination(unittest.TestCase):

@@ -99,18 +99,32 @@ safetv/
 │   ├── incident_classifier.py    # Dual-threshold hysteresis state machine
 │   ├── evidence.py               # Forensic video clip cutting and metadata archival
 │   ├── pipeline.py               # End-to-end detection orchestration engine
+│   ├── webcam.py                 # Persistent stateful webcam session manager
+│   ├── cctv.py                   # Multi-camera RTSP worker & ring buffer engine
+│   ├── alerts.py                 # Rate-limited dispatcher with exponential backoff
+│   ├── review.py                 # Security operator review & dataset curation
+│   ├── calibration.py            # Brier score, ECE & Temperature Scaling
+│   ├── robustness.py             # Adverse environmental perturbation suite
 │   ├── trainer.py                # Fine-tuning loop, learning rate scheduling, evaluation
 │   ├── server.py                 # FastAPI backend & SOC web dashboard
 │   ├── metrics.py                # Classification, FAR, and temporal IoU metrics
 │   └── data/                     # Dataset ingestion, corruption checking, and splits
 ├── tests/
 │   ├── test_safetv.py            # Pipeline and discrimination tests
-│   ├── test_dataset.py           # Split leakage, normalization, corruption tests
+│   ├── test_dataset.py           # Split leakage, normalization, label parsing bug tests
 │   ├── test_trainer.py           # Checkpointing and fine-tuning tests
-│   └── test_server.py            # REST API and dashboard integration tests
+│   ├── test_server.py            # REST API, webcam sessions, traversal rejection
+│   ├── test_cctv.py              # Camera registration, timeline consistency tests
+│   ├── test_alerts.py            # Rate limiting, cooldowns, responsible phrasing
+│   ├── test_calibration.py       # ECE, Brier score, and logit calibration tests
+│   └── test_robustness.py        # Environmental degradation evaluation tests
+├── notebooks/
+│   ├── safetv_colab.ipynb        # Ready-to-run Google Colab cloud GPU notebook
+│   └── SafeTV_Cloud_GPU_Training.ipynb # Kaggle/Colab GPU action recognition pipeline
 ├── run_safetv.py                 # Primary CLI interface (analyze, serve, benchmark)
 ├── train.py                      # Local CPU fine-tuning runner
 ├── train_cloud_gpu.py            # Cloud GPU training runner (Colab / Kaggle)
+├── evaluate_robustness.py        # Environmental stress test runner
 └── prepare_dataset.py            # Dataset preparation and validation CLI
 ```
 
@@ -196,25 +210,35 @@ python train.py --epochs 5 --batch-size 4 --lr 1e-3 --device cpu
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
 | `GET` | `/` | Serves the SafeTV SOC web dashboard |
-| `GET` | `/api/status` | Returns system health, model provenance, and hardware configuration |
-| `POST` | `/api/analyze/upload` | Uploads video file, executes AI inference, cuts evidence clip |
+| `GET` | `/api/status` | Returns system health, model provenance, SHA-256 hash, and readiness |
+| `POST` | `/api/analyze/upload` | Uploads video file (max 250MB), executes AI inference, cuts evidence clip |
+| `POST` | `/api/webcam/session/start` | Initiates persistent, stateful continuous webcam monitoring session |
+| `POST` | `/api/webcam/session/stop` | Terminates session and finalizes any active incidents |
 | `POST` | `/api/analyze/stream-window` | Ingests rolling batch of webcam frames, returns real-time threat probability |
+| `GET` | `/api/cameras` | Lists all registered CCTV RTSP/file streams and telemetry |
+| `POST` | `/api/cameras` | Registers a new RTSP camera stream or video source |
+| `GET` | `/api/alerts` | Retrieves recent dispatched security alerts |
 | `GET` | `/api/incidents` | Lists all detected incidents from the forensic vault |
-| `GET` | `/api/evidence/{filename}` | Streams sliced MP4 evidence video clip for HTML5 playback |
-| `POST` | `/api/incidents/{id}/review`| Submits operator verification (`CONFIRMED_VIOLENCE` / `FALSE_ALARM`) |
+| `GET` | `/api/evidence/{filename}` | Streams sliced MP4 evidence video clip (path-traversal protected) |
+| `POST` | `/api/incidents/{id}/review`| Submits operator verification (`TRUE_POSITIVE` / `FALSE_POSITIVE` / `UNCERTAIN`) |
+| `POST` | `/api/incidents/export-dataset`| Exports human-reviewed clips into retraining directory |
 
 ---
 
 ## Test Suite Execution
 
-To run the complete suite of 26 automated unit and integration tests:
+SafeTV includes 42 automated tests covering all critical sub-systems:
 ```bash
-python -m unittest discover tests
+python -m unittest discover tests -v
 ```
-- `test_safetv.py`: Normal vs violence discrimination, hysteresis thresholds, real-video evaluation.
-- `test_dataset.py`: Source video split isolation, zero leakage verification, tensor shapes.
-- `test_trainer.py`: Checkpoint saving, early stopping, evaluation report generation.
-- `test_server.py`: Video upload API, live frame streaming, incident review workflow.
+- `test_safetv.py`: Sliding spatiotemporal windows, EMA/median smoothing, dual-threshold hysteresis incident state machine, first-onset timestamp verification, cooling-off duration exclusion, normal vs violent activity discrimination.
+- `test_dataset.py`: Source video split isolation, zero leakage verification, tensor extraction, directory labelling collision bug prevention (`parse_video_label`).
+- `test_trainer.py`: Checkpoint saving, safe deserialization, training loop, evaluation reporting.
+- `test_server.py`: Video upload API, persistent webcam sessions, path traversal rejection, incident review, dataset export.
+- `test_cctv.py`: Multi-camera registry, worker lifecycle, synchronized `video_sec` frame indexing and post-buffer queue.
+- `test_alerts.py`: Rate limiting, per-camera cooldowns, retry logic, standardized responsible phrasing.
+- `test_calibration.py`: Brier score calculation, Expected Calibration Error (ECE), and Temperature Scaling.
+- `test_robustness.py`: Environmental stress testing (low light, sensor noise, downsampling, motion blur).
 
 ---
 

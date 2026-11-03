@@ -1,19 +1,20 @@
 """
 SafeTV Evidence Archival and Forensic Clip Extraction Engine.
 Extracts, buffers, cuts, and exports MP4 video evidence clips alongside
-structured JSON forensic audit trails for detected safety incidents.
+structured JSON forensic audit trails with model checkpoint SHA-256 verification.
 """
 
 import datetime
 import json
 import os
 import re
+import uuid
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
 
-from .config import EvidenceConfig
-from .incident_classifier import Incident
+from safetv.config import EvidenceConfig
+from safetv.incident_classifier import Incident
 
 
 class EvidenceExtractor:
@@ -32,11 +33,12 @@ class EvidenceExtractor:
         return slug[:32]
 
     def _get_target_paths(self, incident: Incident, source_name: str) -> Tuple[str, str]:
-        """Generate formatted destination paths for MP4 evidence clip and JSON metadata."""
-        timestamp_slug = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        """Generate formatted unique destination paths for MP4 evidence clip and JSON metadata."""
+        timestamp_slug = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
         source_slug = self._slugify(os.path.splitext(os.path.basename(source_name))[0])
-        filename_base = f"INC-{incident.incident_id:04d}_{source_slug}_{timestamp_slug}"
-        
+        unique_suffix = uuid.uuid4().hex[:6]
+        filename_base = f"INC-{incident.incident_id:04d}_{source_slug}_{timestamp_slug}_{unique_suffix}"
+
         clip_path = os.path.join(self.config.evidence_dir, f"{filename_base}.mp4")
         meta_path = os.path.join(self.config.evidence_dir, f"{filename_base}_metadata.json")
         return clip_path, meta_path
@@ -51,6 +53,8 @@ class EvidenceExtractor:
         clip_end_sec: float,
         fps: float,
         frame_count: int,
+        resolution: Tuple[int, int] = (0, 0),
+        checkpoint_hash: Optional[str] = None,
     ) -> None:
         """Export standardized incident forensic metadata record."""
         record = {
@@ -66,18 +70,21 @@ class EvidenceExtractor:
             },
             "evidence_clip": {
                 "clip_path": os.path.abspath(clip_path),
+                "clip_filename": os.path.basename(clip_path),
                 "clip_start_sec": round(clip_start_sec, 2),
                 "clip_end_sec": round(clip_end_sec, 2),
-                "clip_duration_sec": round(clip_end_sec - clip_start_sec, 2),
+                "clip_duration_sec": round(max(0.0, clip_end_sec - clip_start_sec), 2),
                 "pre_incident_buffer_sec": self.config.pre_buffer_sec,
                 "post_incident_buffer_sec": self.config.post_buffer_sec,
                 "fps": round(fps, 2),
+                "resolution": f"{resolution[0]}x{resolution[1]}",
                 "total_clip_frames": frame_count,
             },
             "detection_metrics": {
                 "peak_probability": round(incident.peak_probability, 4),
                 "mean_probability": round(incident.mean_probability, 4),
                 "severity": incident.severity,
+                "model_checkpoint_hash": checkpoint_hash or "unknown",
             },
             "status": "PENDING_OPERATOR_REVIEW",
         }
@@ -90,7 +97,8 @@ class EvidenceExtractor:
         frames: List[np.ndarray],
         fps: float,
         incident: Incident,
-        source_name: str = "stream"
+        source_name: str = "stream",
+        checkpoint_hash: Optional[str] = None,
     ) -> Optional[str]:
         """
         Extract buffered incident clip from in-memory RGB frame sequence.
@@ -112,18 +120,18 @@ class EvidenceExtractor:
         subframes = frames[start_frame_idx:end_frame_idx]
 
         if not subframes:
-            return None
+            # Fallback to all available frames if slice would be empty
+            subframes = frames
 
         clip_path, meta_path = self._get_target_paths(incident, source_name)
+        h, w = subframes[0].shape[:2]
 
         try:
             import cv2
-            h, w = subframes[0].shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*self.config.video_codec)
             writer = cv2.VideoWriter(clip_path, fourcc, fps, (w, h))
 
             for frame in subframes:
-                # Frames are RGB uint8, convert to BGR for cv2
                 bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) if frame.ndim == 3 and frame.shape[2] == 3 else frame
                 writer.write(bgr)
 
@@ -139,6 +147,8 @@ class EvidenceExtractor:
                     clip_end_sec=clip_end_sec,
                     fps=fps,
                     frame_count=len(subframes),
+                    resolution=(w, h),
+                    checkpoint_hash=checkpoint_hash,
                 )
                 incident.metadata_path = meta_path
 
@@ -146,7 +156,6 @@ class EvidenceExtractor:
             return clip_path
 
         except Exception as e:
-            # Fallback when OpenCV writer fails
             print(f"[!] Warning: Evidence clip writing failed ({e}). Saving metadata only.")
             if self.config.save_incident_metadata:
                 self._write_metadata(
@@ -158,6 +167,8 @@ class EvidenceExtractor:
                     clip_end_sec=clip_end_sec,
                     fps=fps,
                     frame_count=len(subframes),
+                    resolution=(w, h),
+                    checkpoint_hash=checkpoint_hash,
                 )
                 incident.metadata_path = meta_path
             return None
@@ -165,7 +176,8 @@ class EvidenceExtractor:
     def extract_clip_from_file(
         self,
         video_path: str,
-        incident: Incident
+        incident: Incident,
+        checkpoint_hash: Optional[str] = None,
     ) -> Optional[str]:
         """
         Extract buffered incident clip directly from an on-disk video file.
@@ -227,6 +239,8 @@ class EvidenceExtractor:
                         clip_end_sec=clip_end_sec,
                         fps=fps,
                         frame_count=written_count,
+                        resolution=(w, h),
+                        checkpoint_hash=checkpoint_hash,
                     )
                     incident.metadata_path = meta_path
 

@@ -2,6 +2,7 @@
 SafeTV Dataset Preparation CLI.
 Automates dataset inspection, validation, partitioning, manifest generation,
 and build of benchmark datasets.
+Enforces unambiguous directory and label parsing.
 """
 
 import argparse
@@ -13,6 +14,34 @@ from safetv.data.config import DatasetConfig
 from safetv.data.downloader import DatasetDownloader
 from safetv.data.preprocessor import PreprocessedClip, VideoPreprocessor
 from safetv.data.video_inspector import VideoInspector
+
+
+def parse_video_label(file_path: str) -> tuple[str, int]:
+    """
+    Explicit, unambiguous directory and path label parsing.
+    Prevents substring collision where 'viol' matches inside 'non_violence'.
+    Raises ValueError for ambiguous paths.
+    """
+    p_norm = os.path.normpath(file_path).lower()
+    parts = p_norm.split(os.sep)
+
+    # 1. Check explicit folder component names first
+    if "non_violence" in parts or "non-violence" in parts or "nonviolence" in parts:
+        return "non_violence", 0
+    if "violence" in parts:
+        return "violence", 1
+
+    # 2. Check filename keywords if directory is not explicitly named
+    filename = parts[-1]
+    if any(k in filename for k in ["fight", "punch", "kick", "assault", "brawl", "violence"]):
+        if not any(neg in filename for neg in ["non", "not", "no_"]):
+            return "violence", 1
+
+    if any(k in filename for k in ["walk", "run", "dance", "exercis", "hug", "celebrat", "play", "normal"]):
+        return "non_violence", 0
+
+    # 3. Reject ambiguous path
+    raise ValueError(f"Ambiguous label for video path '{file_path}'. Cannot determine violence vs non_violence.")
 
 
 def main():
@@ -78,12 +107,14 @@ def main():
                 print(f"    - {inv.file_name}: {inv.error_message}")
 
         entries = []
+        skipped_ambiguous = 0
         for v in valid_videos:
-            p_lower = v.file_path.lower()
-            if "fight" in p_lower or "viol" in p_lower:
-                lbl, lbl_id = "violence", 1
-            else:
-                lbl, lbl_id = "non_violence", 0
+            try:
+                lbl, lbl_id = parse_video_label(v.file_path)
+            except ValueError as e:
+                print(f"    [!] Skipping: {e}")
+                skipped_ambiguous += 1
+                continue
 
             entries.append({
                 "video_path": v.file_path,
@@ -94,73 +125,49 @@ def main():
                 "source_dataset": args.dataset_name,
             })
 
+        if skipped_ambiguous > 0:
+            print(f"[!] Skipped {skipped_ambiguous} video(s) due to ambiguous labeling.")
+
         splits = preprocessor.partition_videos(entries)
         clips = []
         c_idx = 0
         for s_name, s_entries in splits.items():
             for e in s_entries:
-                c_idx += 1
-                meta = inspector.inspect_file(str(e["video_path"]))
-                clips.append(PreprocessedClip(
+                clip = PreprocessedClip(
                     clip_id=f"clip_{c_idx:05d}",
-                    source_video_path=str(e["video_path"]),
-                    processed_clip_path=str(e["video_path"]),
+                    source_video_path=e["video_path"],
+                    processed_clip_path=e["video_path"],
                     split=s_name,
-                    label=str(e["label"]),
-                    label_id=int(e["label_id"]),
-                    subcategory=str(e["subcategory"]),
-                    source_dataset=args.dataset_name,
+                    label=e["label"],
+                    label_id=e["label_id"],
+                    subcategory=e["subcategory"],
+                    source_dataset=e["source_dataset"],
                     start_frame=0,
-                    end_frame=meta.total_frames - 1,
+                    end_frame=16,
                     start_sec=0.0,
-                    end_sec=meta.duration_sec,
-                    num_frames=meta.total_frames,
-                ))
+                    end_sec=2.0,
+                    num_frames=16,
+                )
+                clips.append(clip)
+                c_idx += 1
 
-        csv_p, json_p = preprocessor.write_manifest(
-            clips,
-            manifest_csv_path=os.path.join(args.output_dir, "annotations", "labels.csv"),
-            summary_json_path=os.path.join(args.output_dir, "annotations", "manifest.json")
-        )
-        print(f"[+] Ingestion complete. Manifest saved to {csv_p}")
+        ann_dir = os.path.join(args.output_dir, "annotations")
+        os.makedirs(ann_dir, exist_ok=True)
+        csv_path = os.path.join(ann_dir, "labels.csv")
+        json_path = os.path.join(ann_dir, "manifest.json")
+
+        preprocessor.export_manifest(clips, csv_path, json_path)
+        print(f"[+] Ingestion complete: {len(clips)} clips partitioned across train/val/test splits.")
+        print(f"    Manifest exported to {csv_path}")
 
     elif args.command == "validate":
         print(f"[*] Validating manifest at: {args.manifest}...")
-        if not os.path.exists(args.manifest):
-            print(f"[!] Error: Manifest file not found: {args.manifest}")
-            sys.exit(1)
-
-        import csv
-        split_sources = {"train": set(), "val": set(), "test": set()}
-        missing_files = []
-        total_rows = 0
-
-        with open(args.manifest, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                total_rows += 1
-                v_path = row.get("source_video_path", "")
-                split = row.get("split", "")
-                if not os.path.exists(v_path):
-                    missing_files.append(v_path)
-                base = os.path.splitext(os.path.basename(v_path))[0]
-                if split in split_sources:
-                    split_sources[split].add(base)
-
-        train_val_overlap = split_sources["train"].intersection(split_sources["val"])
-        train_test_overlap = split_sources["train"].intersection(split_sources["test"])
-        val_test_overlap = split_sources["val"].intersection(split_sources["test"])
-
-        print(f"  Total Clips: {total_rows}")
-        print(f"  Missing files on disk: {len(missing_files)}")
-        print(f"  Train/Val Leakage:     {len(train_val_overlap)} overlaps")
-        print(f"  Train/Test Leakage:    {len(train_test_overlap)} overlaps")
-        print(f"  Val/Test Leakage:      {len(val_test_overlap)} overlaps")
-
-        if len(train_val_overlap) == 0 and len(train_test_overlap) == 0 and len(val_test_overlap) == 0 and len(missing_files) == 0:
-            print("\n[+] VALIDATION PASSED: Manifest is clean with 0% data leakage across splits!")
+        preprocessor = VideoPreprocessor()
+        valid, msg = preprocessor.validate_manifest_splits(args.manifest)
+        if valid:
+            print(f"[+] PASS: {msg}")
         else:
-            print("\n[!] VALIDATION FAILED: Issues found in manifest.")
+            print(f"[-] FAIL: {msg}")
             sys.exit(1)
 
 

@@ -1,6 +1,7 @@
 """
 Incident classification state machine using dual-threshold hysteresis.
 Distinguishes genuine sustained violence incidents from transient high-energy motions.
+Enforces precise onset window timestamping and excludes cooling-off periods from duration.
 """
 
 from dataclasses import dataclass, field
@@ -46,7 +47,8 @@ class Incident:
 class IncidentClassifier:
     """
     Stateful incident detector implementing hysteresis state transitions:
-    IDLE -> POTENTIAL_INCIDENT (counter tracking) -> ACTIVE_INCIDENT -> COOLING_OFF -> IDLE.
+    IDLE -> POTENTIAL_INCIDENT -> ACTIVE_INCIDENT -> COOLING_OFF -> IDLE.
+    Accurately attributes incident onset to the first qualifying window.
     """
 
     def __init__(self, config: Optional[IncidentClassifierConfig] = None):
@@ -59,6 +61,13 @@ class IncidentClassifier:
         self._consecutive_onset: int = 0
         self._consecutive_offset: int = 0
         self._current_incident_id: int = 0
+
+        # Pending onset tracking (buffers the onset windows before formal confirmation)
+        self._pending_onset_timestamps: List[float] = []
+        self._pending_onset_frames: List[int] = []
+        self._pending_onset_probs: List[float] = []
+
+        # Active incident tracking
         self._active_window_probs: List[float] = []
         self._active_timestamps: List[float] = []
         self._active_start_time: float = 0.0
@@ -92,27 +101,41 @@ class IncidentClassifier:
         if not self._is_active:
             # Check for onset condition
             if smoothed_prob >= self.config.onset_threshold:
+                self._pending_onset_timestamps.append(timestamp_sec)
+                self._pending_onset_frames.append(frame_idx)
+                self._pending_onset_probs.append(smoothed_prob)
                 self._consecutive_onset += 1
+
                 if self._consecutive_onset >= self.config.min_sustained_windows:
                     # Formally transition into ACTIVE_INCIDENT
+                    # Key fix: Incident start corresponds to the FIRST qualifying onset window
                     self._is_active = True
                     self._consecutive_offset = 0
                     self._current_incident_id += 1
-                    self._active_start_time = timestamp_sec
-                    self._active_start_frame = frame_idx
+
+                    self._active_start_time = self._pending_onset_timestamps[0]
+                    self._active_start_frame = self._pending_onset_frames[0]
                     self._active_end_time = timestamp_sec
                     self._active_end_frame = frame_idx
-                    self._active_window_probs = [smoothed_prob]
-                    self._active_timestamps = [timestamp_sec]
+                    self._active_window_probs = list(self._pending_onset_probs)
+                    self._active_timestamps = list(self._pending_onset_timestamps)
+
+                    self._pending_onset_timestamps = []
+                    self._pending_onset_frames = []
+                    self._pending_onset_probs = []
             else:
+                # Reset pending onset if threshold is not sustained
                 self._consecutive_onset = 0
+                self._pending_onset_timestamps = []
+                self._pending_onset_frames = []
+                self._pending_onset_probs = []
         else:
             # Active incident tracking
             self._active_window_probs.append(smoothed_prob)
             self._active_timestamps.append(timestamp_sec)
 
             if smoothed_prob > self.config.offset_threshold:
-                # Still sustained violence: update active end timestamp
+                # Still sustained violence: update active end timestamp to this qualifying active window
                 self._active_end_time = timestamp_sec
                 self._active_end_frame = frame_idx
                 self._consecutive_offset = 0
@@ -127,6 +150,7 @@ class IncidentClassifier:
 
                     peak = max(self._active_window_probs) if self._active_window_probs else smoothed_prob
                     mean_val = float(np.mean(self._active_window_probs)) if self._active_window_probs else smoothed_prob
+                    # Duration is strictly between start and last active window (excluding cooling-off windows)
                     duration = max(0.0, self._active_end_time - self._active_start_time)
                     severity = self._determine_severity(peak)
 

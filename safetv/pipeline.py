@@ -2,6 +2,7 @@
 SafeTV Violence Detection Pipeline.
 Unifies spatiotemporal window extraction, genuine trained model inference,
 temporal prediction smoothing, incident state classification, and forensic evidence extraction.
+Enforces strict model readiness and checkpoint provenance verification.
 """
 
 import json
@@ -14,7 +15,7 @@ import numpy as np
 from .config import SafeTVConfig
 from .evidence import EvidenceExtractor
 from .incident_classifier import Incident, IncidentClassifier
-from .model import VideoActionClassifier
+from .model import ModelNotReadyError, VideoActionClassifier
 from .temporal_smoothing import TemporalSmoother
 from .video_loader import VideoWindow, VideoWindowExtractor
 
@@ -61,7 +62,9 @@ class PipelineReport:
     fps: float
     execution_time_sec: float
     is_model_trained: bool
+    is_model_ready: bool
     model_provenance: str
+    checkpoint_hash: Optional[str]
     window_timeline: List[Dict]
 
     def to_dict(self) -> dict:
@@ -76,7 +79,9 @@ class PipelineReport:
             "fps": round(self.fps, 2),
             "execution_time_sec": round(self.execution_time_sec, 3),
             "is_model_trained": self.is_model_trained,
+            "is_model_ready": self.is_model_ready,
             "model_provenance": self.model_provenance,
+            "checkpoint_hash": self.checkpoint_hash,
             "window_timeline": self.window_timeline,
         }
 
@@ -109,12 +114,16 @@ class SafeTVPipeline:
         self,
         frames: List[np.ndarray],
         fps: float = 30.0,
-        source_name: str = "frame_sequence"
+        source_name: str = "frame_sequence",
+        reset_state: bool = True
     ) -> PipelineReport:
         """
         Process an in-memory sequence of RGB uint8 video frames.
+        reset_state: If False (e.g. streaming/webcam session), preserves temporal smoother and state machine.
         """
-        self.reset()
+        if reset_state:
+            self.reset()
+
         start_exec = time.time()
         timeline: List[WindowResult] = []
         raw_probs: List[float] = []
@@ -124,21 +133,27 @@ class SafeTVPipeline:
         last_end_time = 0.0
 
         for window in self.extractor.extract_from_frames(frames, fps=fps):
-            # 1. Genuine AI model inference
-            preds = self.model.predict_window(window.tensor)
-            raw_prob = float(preds["violence_prob"])
+            # 1. Genuine AI model inference (allow_uncalibrated=True if running uncalibrated baseline)
+            try:
+                preds = self.model.predict_window(window.tensor, allow_uncalibrated=not self.model.is_ready)
+                raw_prob = float(preds["violence_prob"])
+            except ModelNotReadyError:
+                raw_prob = 0.0
 
             # 2. Temporal smoothing
             smoothed_prob = self.smoother.update(raw_prob)
 
-            # 3. Incident classification
-            self.incident_classifier.process_window(
-                smoothed_prob=smoothed_prob,
-                timestamp_sec=window.center_time_sec,
-                frame_idx=window.end_frame
-            )
+            # 3. Incident classification (only if model is trained and ready)
+            if self.model.is_ready:
+                self.incident_classifier.process_window(
+                    smoothed_prob=smoothed_prob,
+                    timestamp_sec=window.center_time_sec,
+                    frame_idx=window.end_frame
+                )
+                is_active = self.incident_classifier.is_incident_active
+            else:
+                is_active = False
 
-            is_active = self.incident_classifier.is_incident_active
             label = "VIOLENCE" if smoothed_prob >= self.config.incident.onset_threshold else "NORMAL"
 
             res = WindowResult(
@@ -160,18 +175,23 @@ class SafeTVPipeline:
             last_end_time = max(last_end_time, window.end_time_sec)
             window_idx += 1
 
-        # Finalize open incidents
-        final_incidents = self.incident_classifier.finalize()
+        # Finalize open incidents if batch is finalizing
+        if reset_state and self.model.is_ready:
+            final_incidents = self.incident_classifier.finalize()
+        else:
+            final_incidents = list(self.incident_classifier.completed_incidents)
 
         # 4. Extract buffered evidence clips
-        if self.config.evidence.save_evidence_clips:
+        if self.config.evidence.save_evidence_clips and self.model.is_ready:
             for inc in final_incidents:
-                self.evidence_extractor.extract_clip_from_frames(
-                    frames=frames,
-                    fps=fps,
-                    incident=inc,
-                    source_name=source_name,
-                )
+                if not inc.evidence_path:
+                    self.evidence_extractor.extract_clip_from_frames(
+                        frames=frames,
+                        fps=fps,
+                        incident=inc,
+                        source_name=source_name,
+                        checkpoint_hash=self.model.checkpoint_hash,
+                    )
 
         exec_duration = time.time() - start_exec
         peak_val = max(smoothed_probs) if smoothed_probs else 0.0
@@ -188,7 +208,9 @@ class SafeTVPipeline:
             fps=fps,
             execution_time_sec=exec_duration,
             is_model_trained=self.model.is_trained,
+            is_model_ready=self.model.is_ready,
             model_provenance=self.model.provenance,
+            checkpoint_hash=self.model.checkpoint_hash,
             window_timeline=[w.to_dict() for w in timeline],
         )
 
@@ -212,17 +234,24 @@ class SafeTVPipeline:
 
         for window in self.extractor.extract_from_file(video_path, max_duration_sec=max_duration_sec):
             fps_detected = window.fps
-            preds = self.model.predict_window(window.tensor)
-            raw_prob = float(preds["violence_prob"])
+            try:
+                preds = self.model.predict_window(window.tensor, allow_uncalibrated=not self.model.is_ready)
+                raw_prob = float(preds["violence_prob"])
+            except ModelNotReadyError:
+                raw_prob = 0.0
+
             smoothed_prob = self.smoother.update(raw_prob)
 
-            self.incident_classifier.process_window(
-                smoothed_prob=smoothed_prob,
-                timestamp_sec=window.center_time_sec,
-                frame_idx=window.end_frame
-            )
+            if self.model.is_ready:
+                self.incident_classifier.process_window(
+                    smoothed_prob=smoothed_prob,
+                    timestamp_sec=window.center_time_sec,
+                    frame_idx=window.end_frame
+                )
+                is_active = self.incident_classifier.is_incident_active
+            else:
+                is_active = False
 
-            is_active = self.incident_classifier.is_incident_active
             label = "VIOLENCE" if smoothed_prob >= self.config.incident.onset_threshold else "NORMAL"
 
             res = WindowResult(
@@ -244,14 +273,15 @@ class SafeTVPipeline:
             last_end_time = max(last_end_time, window.end_time_sec)
             window_idx += 1
 
-        final_incidents = self.incident_classifier.finalize()
+        final_incidents = self.incident_classifier.finalize() if self.model.is_ready else []
 
         # Extract buffered evidence clips from file
-        if self.config.evidence.save_evidence_clips:
+        if self.config.evidence.save_evidence_clips and self.model.is_ready:
             for inc in final_incidents:
                 self.evidence_extractor.extract_clip_from_file(
                     video_path=video_path,
                     incident=inc,
+                    checkpoint_hash=self.model.checkpoint_hash,
                 )
 
         exec_duration = time.time() - start_exec
@@ -270,6 +300,8 @@ class SafeTVPipeline:
             fps=fps_detected,
             execution_time_sec=exec_duration,
             is_model_trained=self.model.is_trained,
+            is_model_ready=self.model.is_ready,
             model_provenance=self.model.provenance,
+            checkpoint_hash=self.model.checkpoint_hash,
             window_timeline=[w.to_dict() for w in timeline],
         )

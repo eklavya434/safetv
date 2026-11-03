@@ -1,7 +1,8 @@
 """
 SafeTV Alert & Notification Dispatch Engine.
-Dispatches real-time security alerts via Webhooks, Email (SMTP), and Audit Logs
-with rate-limiting, deduplication, and evidence clip linkages.
+Dispatches real-time security alerts via Webhooks and persistent Audit Logs
+with per-camera rate-limiting, deduplication, retry logic, and evidence clip linkages.
+Enforces responsible AI phrasing: "Potential physical violence detected — human verification required."
 """
 
 import datetime
@@ -23,12 +24,14 @@ logger = logging.getLogger("safetv.alerts")
 @dataclass
 class AlertConfig:
     """Configuration for alert channels, webhooks, and rate-limiting."""
-    webhook_url: Optional[str] = None         # Target URL for HTTP POST notifications
+    webhook_url: Optional[str] = field(default_factory=lambda: os.getenv("SAFETV_WEBHOOK_URL"))
     enable_webhook: bool = True
-    cooldown_seconds: float = 30.0            # Minimum seconds between repeated alerts for the same camera
+    cooldown_seconds: float = float(os.getenv("SAFETV_ALERT_COOLDOWN", "30.0"))
     alert_log_file: str = "evidence/alerts.json"
     include_evidence_link: bool = True
-    base_server_url: str = "http://127.0.0.1:8000"
+    base_server_url: str = os.getenv("SAFETV_SERVER_URL", "http://127.0.0.1:8000")
+    max_retries: int = 3
+    retry_delay_sec: float = 1.0
 
 
 @dataclass
@@ -44,7 +47,9 @@ class AlertNotification:
     duration_sec: float
     message: str
     evidence_clip_url: Optional[str] = None
-    status: str = "DISPATCHED"
+    status: str = "QUEUED"  # QUEUED, DELIVERED, FAILED
+    delivery_attempts: int = 0
+    delivery_error: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -96,7 +101,7 @@ class AlertDispatcher:
         camera_name: str = "Surveillance Feed"
     ) -> Optional[AlertNotification]:
         """
-        Create and dispatch a high-priority safety altercation alert.
+        Create and dispatch a safety altercation alert with responsible phrasing.
         """
         now = time.time()
         with self._lock:
@@ -107,17 +112,20 @@ class AlertDispatcher:
             self._last_alert_time[camera_id] = now
 
         alert_id = f"ALT-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{incident.incident_id:04d}"
-        
+
         evidence_url = None
         if incident.evidence_path and self.config.include_evidence_link:
             filename = os.path.basename(incident.evidence_path)
             evidence_url = f"{self.config.base_server_url}/api/evidence/{filename}"
 
+        # Standardized responsible phrasing
         message = (
-            f"EMERGENCY ALERT: Potential physical violence detected on '{camera_name}'! "
-            f"Severity: {incident.severity} (Confidence: {incident.peak_probability * 100:.1f}%, "
-            f"Duration: {incident.duration_sec:.2f}s)."
+            f"Potential physical violence detected on '{camera_name}' — human verification required. "
+            f"Severity: {incident.severity} (Peak Confidence: {incident.peak_probability * 100:.1f}%, "
+            f"Estimated Duration: {incident.duration_sec:.2f}s)."
         )
+
+        initial_status = "DISPATCHED" if not (self.config.enable_webhook and self.config.webhook_url) else "QUEUED"
 
         notification = AlertNotification(
             alert_id=alert_id,
@@ -130,38 +138,69 @@ class AlertDispatcher:
             duration_sec=round(incident.duration_sec, 2),
             message=message,
             evidence_clip_url=evidence_url,
-            status="DISPATCHED",
+            status=initial_status,
+            delivery_attempts=0,
         )
 
         with self._lock:
             self._alert_history.append(notification)
             self._save_alert_history()
 
-        # Send Webhook asynchronously if configured
+        # Send Webhook asynchronously with retries if configured
         if self.config.enable_webhook and self.config.webhook_url:
             threading.Thread(
-                target=self._send_webhook,
-                args=(self.config.webhook_url, notification.to_dict()),
+                target=self._send_webhook_with_retry,
+                args=(notification,),
                 daemon=True
             ).start()
 
         logger.warning(f" [!] {notification.message}")
         return notification
 
-    def _send_webhook(self, url: str, payload: dict) -> None:
-        """Send JSON webhook HTTP POST."""
-        try:
-            req_data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                url,
-                data=req_data,
-                headers={"Content-Type": "application/json", "User-Agent": "SafeTV-Alert-Engine/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=5) as response:
-                if response.status >= 200 and response.status < 300:
-                    logger.info(f"Webhook delivered successfully to {url}")
-        except Exception as e:
-            logger.error(f"Webhook delivery failed for {url}: {e}")
+    def _send_webhook_with_retry(self, notification: AlertNotification) -> None:
+        """Send JSON webhook HTTP POST with exponential backoff retry."""
+        url = self.config.webhook_url
+        if not url:
+            return
+
+        payload = notification.to_dict()
+        req_data = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "SafeTV-Alert-Engine/1.0"
+        }
+
+        # Check for optional Authorization header in environment
+        auth_header = os.getenv("SAFETV_WEBHOOK_AUTH")
+        if auth_header:
+            headers["Authorization"] = auth_header
+
+        delivered = False
+        last_err = None
+
+        for attempt in range(1, self.config.max_retries + 1):
+            notification.delivery_attempts = attempt
+            try:
+                req = urllib.request.Request(url, data=req_data, headers=headers)
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    if 200 <= response.status < 300:
+                        delivered = True
+                        notification.status = "DELIVERED"
+                        notification.delivery_error = None
+                        logger.info(f"Webhook delivered successfully to {url} (attempt {attempt})")
+                        break
+            except Exception as e:
+                last_err = str(e)
+                logger.warning(f"Webhook attempt {attempt} failed for {url}: {e}")
+                time.sleep(self.config.retry_delay_sec * attempt)
+
+        if not delivered:
+            notification.status = "FAILED"
+            notification.delivery_error = last_err
+            logger.error(f"Webhook delivery permanently failed for {url}: {last_err}")
+
+        with self._lock:
+            self._save_alert_history()
 
     def get_recent_alerts(self, limit: int = 50) -> List[Dict]:
         """Retrieve recent alert notifications."""
