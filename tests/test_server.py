@@ -1,0 +1,113 @@
+"""
+Unit and Integration Tests for SafeTV FastAPI Server & Security Dashboard.
+Tests file upload analysis, live webcam stream inference, incident listing,
+forensic clip streaming, and operator review submission.
+"""
+
+import base64
+import os
+import unittest
+from fastapi.testclient import TestClient
+import numpy as np
+import cv2
+
+from safetv.server import app
+
+
+class TestSafeTVServer(unittest.TestCase):
+    """Integration test suite for SafeTV backend server endpoints."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def test_status_endpoint(self):
+        """Validates that system status returns engine online and model configuration."""
+        response = self.client.get("/api/status")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "ONLINE")
+        self.assertIn("model", data)
+        self.assertTrue(data["model"]["is_trained"])
+        self.assertEqual(data["model"]["provenance"], "trained")
+
+    def test_dashboard_html_served(self):
+        """Validates that root path serves the SOC HTML5 dashboard."""
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/html", response.headers["content-type"])
+        self.assertIn("SafeTV", response.text)
+        self.assertIn("Live Camera Safety Feed", response.text)
+
+    def test_upload_and_analyze_violence_video(self):
+        """Validates video upload, deep model inference, and incident evidence creation."""
+        test_video = os.path.join("data", "raw", "violence", "punching_001.mp4")
+        if not os.path.exists(test_video):
+            self.skipTest(f"{test_video} not found")
+
+        with open(test_video, "rb") as f:
+            files = {"file": ("punching_001.mp4", f, "video/mp4")}
+            response = self.client.post("/api/analyze/upload", files=files)
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["success"])
+        report = data["report"]
+        self.assertGreaterEqual(report["incidents_detected"], 1)
+        self.assertGreater(report["peak_violence_prob"], 0.65)
+        self.assertTrue(report["is_model_trained"])
+
+        # Check evidence clip
+        inc = report["incidents"][0]
+        self.assertIn("evidence_filename", inc)
+        evidence_fn = inc["evidence_filename"]
+
+        # Validate that the evidence clip can be streamed
+        clip_resp = self.client.get(f"/api/evidence/{evidence_fn}")
+        self.assertEqual(clip_resp.status_code, 200)
+        self.assertEqual(clip_resp.headers["content-type"], "video/mp4")
+
+    def test_incidents_vault_and_review(self):
+        """Validates incident retrieval and security operator review submission."""
+        response = self.client.get("/api/incidents")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("incidents", data)
+
+        if data["incidents"]:
+            first_inc = data["incidents"][0]
+            inc_id = str(first_inc["incident_id"])
+
+            review_payload = {
+                "status": "CONFIRMED_VIOLENCE",
+                "reviewer_notes": "Verified by security lead; immediate dispatch required.",
+                "reviewer_name": "Lead Guard",
+            }
+            review_resp = self.client.post(f"/api/incidents/{inc_id}/review", json=review_payload)
+            self.assertEqual(review_resp.status_code, 200)
+            self.assertEqual(review_resp.json()["status"], "CONFIRMED_VIOLENCE")
+
+    def test_stream_window_inference(self):
+        """Validates live webcam frame batch streaming and inference."""
+        # Synthesize 16 simple JPEG base64 frames
+        frames_b64 = []
+        for _ in range(16):
+            img = np.full((120, 160, 3), fill_value=120, dtype=np.uint8)
+            _, buf = cv2.imencode(".jpg", img)
+            b64_str = base64.b64encode(buf).decode("utf-8")
+            frames_b64.append(f"data:image/jpeg;base64,{b64_str}")
+
+        payload = {
+            "frames_base64": frames_b64,
+            "fps": 15.0,
+        }
+        response = self.client.post("/api/analyze/stream-window", json=payload)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["success"])
+        self.assertIn("smoothed_violence_prob", data)
+        self.assertTrue(data["is_model_trained"])
+
+
+if __name__ == "__main__":
+    unittest.main()

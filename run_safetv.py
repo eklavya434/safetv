@@ -218,6 +218,10 @@ def main():
     eval_parser = subparsers.add_parser("eval-dataset", help="Evaluate pipeline across dataset directory")
     eval_parser.add_argument("--dir", type=str, default="data/raw", help="Path to video directory")
 
+    serve_parser = subparsers.add_parser("serve", help="Launch SafeTV Web Dashboard & API Server")
+    serve_parser.add_argument("--host", type=str, default="127.0.0.1", help="Host interface (default: 127.0.0.1)")
+    serve_parser.add_argument("--port", type=int, default=8000, help="Port to listen on (default: 8000)")
+
     args = parser.parse_args()
 
     if args.command == "benchmark" or args.command is None:
@@ -227,6 +231,9 @@ def main():
         analyze_video(args.video_path, output_path=args.output, max_duration=args.max_duration)
     elif args.command == "eval-dataset":
         evaluate_dataset(args.dir)
+    elif args.command == "serve":
+        from safetv.server import run_server
+        run_server(host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

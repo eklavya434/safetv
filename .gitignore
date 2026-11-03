@@ -43,6 +43,7 @@ incident_report.json
 benchmark_report.json
 *.log
 evidence/
+uploads/
 
 # Video Data
 data/raw/
