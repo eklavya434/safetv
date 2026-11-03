@@ -43,6 +43,11 @@ incident_report.json
 benchmark_report.json
 *.log
 
+# Video Data
+data/raw/
+data/processed/
+!data/annotations/
+
 # IDEs
 .vscode/
 .idea/
