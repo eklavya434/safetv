@@ -4,8 +4,9 @@ Distinguishes genuine sustained violence incidents from transient high-energy mo
 Enforces precise onset window timestamping and excludes cooling-off periods from duration.
 """
 
+import uuid
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Union
 import numpy as np
 
 from .config import IncidentClassifierConfig
@@ -14,7 +15,7 @@ from .config import IncidentClassifierConfig
 @dataclass
 class Incident:
     """Represents a detected violent incident with spatiotemporal timestamps and severity."""
-    incident_id: int
+    incident_id: Union[int, str]
     start_time_sec: float
     end_time_sec: float
     duration_sec: float
@@ -23,6 +24,7 @@ class Incident:
     peak_probability: float
     mean_probability: float
     severity: str
+    incident_uuid: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     sample_timestamps: List[float] = field(default_factory=list)
     sample_probabilities: List[float] = field(default_factory=list)
     evidence_path: Optional[str] = None
@@ -31,6 +33,7 @@ class Incident:
     def to_dict(self) -> dict:
         return {
             "incident_id": self.incident_id,
+            "incident_uuid": self.incident_uuid,
             "start_time_sec": round(self.start_time_sec, 2),
             "end_time_sec": round(self.end_time_sec, 2),
             "duration_sec": round(self.duration_sec, 2),

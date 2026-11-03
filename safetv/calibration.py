@@ -59,6 +59,68 @@ class ProbabilityCalibrator:
                 "calibration_date": str(np.datetime64("now")),
             }, f, indent=2)
 
+    def fit(self, logits: np.ndarray, labels: np.ndarray) -> float:
+        """
+        Fits optimal temperature scaling parameter T via Negative Log Likelihood (NLL) minimization
+        on validation set logits and ground truth labels (Guo et al., 2017).
+        """
+        logits_arr = np.array(logits, dtype=np.float64)
+        labels_arr = np.array(labels, dtype=np.int64)
+
+        if len(logits_arr) == 0 or len(labels_arr) == 0:
+            return self.temperature
+
+        def nll_objective(t_val: float) -> float:
+            t = max(0.01, float(t_val))
+            scaled = logits_arr / t
+            # Stable log-softmax: z - max(z) - log(sum(exp(z - max(z))))
+            max_z = np.max(scaled, axis=-1, keepdims=True)
+            shifted = scaled - max_z
+            log_sum_exp = np.log(np.sum(np.exp(shifted), axis=-1, keepdims=True) + 1e-12)
+            log_probs = shifted - log_sum_exp
+
+            # Extract log prob for true class
+            nll = 0.0
+            for idx, target in enumerate(labels_arr):
+                nll -= log_probs[idx, target]
+            return float(nll / len(labels_arr))
+
+        # Optimize using scipy if installed, otherwise fine golden-section search
+        best_t = 1.0
+        try:
+            from scipy.optimize import minimize_scalar
+            res = minimize_scalar(nll_objective, bounds=(0.05, 10.0), method="bounded")
+            if res.success:
+                best_t = float(res.x)
+        except ImportError:
+            # Golden section search over [0.05, 10.0]
+            a, b = 0.05, 10.0
+            invphi = (np.sqrt(5) - 1) / 2
+            invphi2 = (3 - np.sqrt(5)) / 2
+            h = b - a
+            c = a + invphi2 * h
+            d = a + invphi * h
+            yc = nll_objective(c)
+            yd = nll_objective(d)
+
+            for _ in range(30):
+                if yc < yd:
+                    b, d, yd = d, c, yc
+                    h = invphi * h
+                    c = a + invphi2 * h
+                    yc = nll_objective(c)
+                else:
+                    a, c, yc = c, d, yd
+                    h = invphi * h
+                    d = a + invphi * h
+                    yd = nll_objective(d)
+
+            best_t = float((a + b) / 2.0)
+
+        self.temperature = max(0.01, round(best_t, 4))
+        self.save_calibration()
+        return self.temperature
+
     def calibrate_logits(self, logits: np.ndarray) -> np.ndarray:
         """
         Scales logits by temperature and applies softmax:

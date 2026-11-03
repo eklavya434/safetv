@@ -101,6 +101,9 @@ class RTSPStreamWorker:
         self.last_frame_time: Optional[float] = None
         self.session_start_time: Optional[float] = None
         self.session_frame_count: int = 0
+        self.consecutive_failures: int = 0
+        self.max_reconnect_attempts: int = 10
+        self.frames_dropped: int = 0
 
     def start(self) -> None:
         """Start the camera ingestion and AI monitoring thread."""
@@ -152,6 +155,8 @@ class RTSPStreamWorker:
                     if not ret:
                         break
 
+                    self.consecutive_failures = 0
+
                     now_mono = time.monotonic()
                     now_wall = datetime.datetime.now().isoformat()
                     video_sec = self.session_frame_count / target_fps
@@ -193,6 +198,7 @@ class RTSPStreamWorker:
                     time.sleep(max(0.001, 1.0 / target_fps - 0.005))
 
             except Exception as e:
+                self.consecutive_failures += 1
                 self.last_error = str(e)
                 logger.error(f"Camera '{self.camera.camera_id}' error: {e}")
             finally:
@@ -200,8 +206,16 @@ class RTSPStreamWorker:
                     cap.release()
 
             if not self._stop_event.is_set():
+                if self.consecutive_failures >= self.max_reconnect_attempts:
+                    self.status = "ERROR"
+                    self.last_error = f"Max reconnection attempts ({self.max_reconnect_attempts}) exceeded. Stream stopped."
+                    logger.error(f"Camera '{self.camera.camera_id}' {self.last_error}")
+                    break
+
                 self.status = "RECONNECTING"
-                time.sleep(self.camera.reconnect_interval_sec)
+                backoff_sec = min(60.0, self.camera.reconnect_interval_sec * (2 ** min(self.consecutive_failures - 1, 5)))
+                logger.info(f"Reconnecting camera '{self.camera.camera_id}' in {backoff_sec:.1f}s (attempt {self.consecutive_failures}/{self.max_reconnect_attempts})")
+                time.sleep(backoff_sec)
 
         self.status = "STOPPED"
 
@@ -308,6 +322,9 @@ class RTSPStreamWorker:
                 "is_incident_active": self.incident_classifier.is_incident_active,
                 "last_error": self.last_error,
                 "last_frame_time": self.last_frame_time,
+                "queue_depth": len(self._frame_buffer),
+                "frames_dropped": self.frames_dropped,
+                "consecutive_failures": self.consecutive_failures,
             }
 
 
