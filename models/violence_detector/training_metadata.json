@@ -1,0 +1,99 @@
+{
+  "model_version": "1.0.0",
+  "training_date": "2026-11-03T09:36:04.572307",
+  "architecture": "r2plus1d_18",
+  "training_parameters": {
+    "architecture": "r2plus1d_18",
+    "pretrained_backbone": true,
+    "manifest_csv": "data/annotations/labels.csv",
+    "output_dir": "models/violence_detector",
+    "epochs": 5,
+    "batch_size": 4,
+    "learning_rate": 0.001,
+    "backbone_learning_rate": 5e-05,
+    "weight_decay": 0.0001,
+    "gradient_clip_norm": 1.0,
+    "early_stopping_patience": 4,
+    "min_delta": 0.005,
+    "device": "cpu",
+    "num_threads": 6,
+    "num_workers": 0,
+    "random_seed": 42
+  },
+  "best_val_metrics": {
+    "total_samples": 7,
+    "true_positives": 3,
+    "false_positives": 0,
+    "true_negatives": 4,
+    "false_negatives": 0,
+    "accuracy": 1.0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "specificity": 1.0,
+    "f1_score": 1.0,
+    "balanced_accuracy": 1.0,
+    "false_alarm_rate": 0.0,
+    "mean_detection_latency_sec": null,
+    "mean_temporal_iou": null
+  },
+  "total_epochs_trained": 2,
+  "dataset_counts": {
+    "train_clips": 29,
+    "val_clips": 7,
+    "test_clips": 4
+  },
+  "training_history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.6633023491927555,
+      "train_acc": 0.5,
+      "val_loss": 0.6687384758676801,
+      "val_f1": 0.6,
+      "val_acc": 0.42857142857142855
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.518287433045251,
+      "train_acc": 0.7857142857142857,
+      "val_loss": 0.37095380255154203,
+      "val_f1": 1.0,
+      "val_acc": 1.0
+    }
+  ],
+  "unseen_test_evaluation": {
+    "total_samples": 4,
+    "true_positives": 1,
+    "false_positives": 0,
+    "true_negatives": 3,
+    "false_negatives": 0,
+    "accuracy": 1.0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "specificity": 1.0,
+    "f1_score": 1.0,
+    "balanced_accuracy": 1.0,
+    "false_alarm_rate": 0.0,
+    "mean_detection_latency_sec": null,
+    "mean_temporal_iou": null,
+    "test_loss": 0.3847,
+    "latency_per_clip_ms": 1065.44,
+    "model_size_mb": 119.82,
+    "subcategory_breakdown": {
+      "punching": {
+        "correct": 1,
+        "incorrect": 0,
+        "total": 1
+      },
+      "running": {
+        "correct": 1,
+        "incorrect": 0,
+        "total": 1
+      },
+      "hugging": {
+        "correct": 2,
+        "incorrect": 0,
+        "total": 2
+      }
+    }
+  }
+}

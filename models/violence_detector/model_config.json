@@ -1,0 +1,21 @@
+{
+  "architecture": "r2plus1d_18",
+  "num_classes": 2,
+  "input_shape": [
+    3,
+    16,
+    112,
+    112
+  ],
+  "normalization_mean": [
+    0.43216,
+    0.394666,
+    0.37645
+  ],
+  "normalization_std": [
+    0.22803,
+    0.22145,
+    0.216989
+  ],
+  "num_threads": 6
+}
