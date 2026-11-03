@@ -239,6 +239,8 @@ class VideoActionClassifier:
             self.model_status_message = f"Valid trained checkpoint loaded from {checkpoint_path} (SHA-256: {self.checkpoint_hash[:12]}...)"
             logger.info(self.model_status_message)
 
+        except ModelNotReadyError:
+            raise
         except Exception as e:
             self.is_trained = False
             self.is_ready = False

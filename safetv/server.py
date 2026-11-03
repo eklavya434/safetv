@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time
 from typing import Dict, List, Optional
 
@@ -175,12 +176,51 @@ async def get_model_health():
     return pipeline.model.get_health_report()
 
 
+class InMemoryRateLimiter:
+    """Sliding-window rate limiter per client identifier."""
+    def __init__(self, max_requests: int = 30, window_seconds: float = 60.0):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._history: Dict[str, List[float]] = {}
+        self._lock = threading.Lock()
+
+    def is_allowed(self, client_id: str) -> bool:
+        now = time.time()
+        with self._lock:
+            timestamps = self._history.get(client_id, [])
+            cutoff = now - self.window_seconds
+            timestamps = [t for t in timestamps if t > cutoff]
+            if len(timestamps) >= self.max_requests:
+                self._history[client_id] = timestamps
+                return False
+            timestamps.append(now)
+            self._history[client_id] = timestamps
+            return True
+
+
+upload_rate_limiter = InMemoryRateLimiter(
+    max_requests=int(os.getenv("SAFETV_UPLOAD_RATE_LIMIT", "30")),
+    window_seconds=60.0,
+)
+
+
 @app.post("/api/analyze/upload")
-async def upload_and_analyze_video(file: UploadFile = File(...), _: None = Depends(verify_api_key)):
+async def upload_and_analyze_video(
+    request: Request,
+    file: UploadFile = File(...),
+    _: None = Depends(verify_api_key)
+):
     """
     Upload a surveillance video recording, execute genuine AI analysis,
     generate incident records, extract forensic MP4 evidence clips, and trigger alerts.
     """
+    client_ip = request.client.host if request.client else "unknown"
+    if not upload_rate_limiter.is_allowed(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Upload rate limit exceeded. Please wait before submitting another video."
+        )
+
     valid_exts = [".mp4", ".avi", ".mov", ".mkv", ".webm"]
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in valid_exts:
@@ -321,11 +361,12 @@ async def analyze_stream_window(payload: WebcamWindowPayload, _: None = Depends(
 
 
 import ipaddress
+import socket
 from urllib.parse import urlparse
 
 
 def _validate_camera_url(url: str) -> None:
-    """Prevent SSRF by validating camera source URLs."""
+    """Prevent SSRF and DNS rebinding by validating camera source URLs."""
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
     # Empty scheme represents local file path on disk (e.g. data/raw/video.mp4)
@@ -339,23 +380,39 @@ def _validate_camera_url(url: str) -> None:
     hostname = parsed.hostname or ""
     if scheme in {"rtsp", "rtsps"}:
         allowed_hosts_raw = os.getenv("SAFETV_ALLOWED_CAMERA_HOSTS", "")
-        allowed_hosts = {h.strip() for h in allowed_hosts_raw.split(",") if h.strip()}
-        if hostname not in allowed_hosts:
+        allowed_hosts = {h.strip().lower() for h in allowed_hosts_raw.split(",") if h.strip()}
+        if hostname.lower() in allowed_hosts:
+            return
+
+        # Check direct IP
+        try:
+            addr = ipaddress.ip_address(hostname)
+            if addr.is_loopback or addr.is_private or addr.is_link_local:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Camera URL host '{hostname}' is a private/loopback address. "
+                           "Set SAFETV_ALLOWED_CAMERA_HOSTS to allow this host."
+                )
+        except ValueError:
+            # Domain name: resolve DNS to prevent DNS rebinding attacks
             try:
-                addr = ipaddress.ip_address(hostname)
-                if addr.is_loopback or addr.is_private or addr.is_link_local:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Camera URL host '{hostname}' is a private/loopback address. "
-                               "Set SAFETV_ALLOWED_CAMERA_HOSTS to allow this host."
-                    )
-            except ValueError:
+                addr_info = socket.getaddrinfo(hostname, parsed.port or 554, socket.AF_UNSPEC, socket.SOCK_STREAM)
+                for *_, sockaddr in addr_info:
+                    resolved_ip = sockaddr[0]
+                    resolved_obj = ipaddress.ip_address(resolved_ip)
+                    if resolved_obj.is_loopback or resolved_obj.is_private or resolved_obj.is_link_local:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Camera hostname '{hostname}' resolves to private address '{resolved_ip}'. "
+                                   "Set SAFETV_ALLOWED_CAMERA_HOSTS to allow this host."
+                        )
+            except socket.gaierror:
                 pass
 
 
 # CCTV Multi-Camera Endpoints
 @app.get("/api/cameras")
-async def list_cameras():
+async def list_cameras(_: None = Depends(verify_api_key)):
     """Retrieve all registered surveillance camera feeds and their live streaming telemetry."""
     return {"cameras": camera_manager.get_all_camera_statuses()}
 
@@ -401,7 +458,7 @@ async def stop_camera(camera_id: str, _: None = Depends(verify_api_key)):
 
 # Alert & Incident Endpoints
 @app.get("/api/alerts")
-async def list_alerts():
+async def list_alerts(_: None = Depends(verify_api_key)):
     """Retrieve recent dispatched security alerts."""
     return {"alerts": alert_dispatcher.get_recent_alerts()}
 
@@ -429,7 +486,7 @@ async def trigger_test_alert(_: None = Depends(verify_api_key)):
 
 
 @app.get("/api/incidents")
-async def list_incidents():
+async def list_incidents(_: None = Depends(verify_api_key)):
     """List all detected incidents from the forensic evidence repository."""
     return {"incidents": load_all_incidents()}
 

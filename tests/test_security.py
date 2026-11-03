@@ -115,5 +115,73 @@ class TestCORSConfiguration(unittest.TestCase):
             "CRITICAL: Wildcard CORS literal allow_origins=[\"*\"] found in server.py")
 
 
+class TestRouteSecurity(unittest.TestCase):
+    """Programmatic route enumeration security test."""
+
+    def test_protected_routes_have_api_key_dependency(self):
+        """All sensitive and mutating routes must have verify_api_key dependency."""
+        from safetv.server import app, verify_api_key
+        from fastapi.routing import APIRoute
+
+        # Public allowlist
+        public_routes = {
+            "/",
+            "/api/status",
+            "/api/model/health",
+            "/api/evidence/{filename}",
+            "/docs",
+            "/docs/oauth2-redirect",
+            "/redoc",
+            "/openapi.json",
+        }
+
+        unprotected = []
+        for route in app.routes:
+            if isinstance(route, APIRoute):
+                path = route.path
+                if path in public_routes:
+                    continue
+                # Inspect dependencies on route
+                dep_callables = [d.call for d in route.dependant.dependencies]
+                if verify_api_key not in dep_callables:
+                    unprotected.append(f"{route.methods} {path}")
+
+        self.assertEqual(
+            unprotected,
+            [],
+            f"The following routes lack verify_api_key dependency: {unprotected}"
+        )
+
+
+class TestRateLimiter(unittest.TestCase):
+    """Test in-memory sliding window rate limiter."""
+
+    def test_rate_limiter_allows_under_limit_and_blocks_over_limit(self):
+        from safetv.server import InMemoryRateLimiter
+        limiter = InMemoryRateLimiter(max_requests=3, window_seconds=1.0)
+        self.assertTrue(limiter.is_allowed("client1"))
+        self.assertTrue(limiter.is_allowed("client1"))
+        self.assertTrue(limiter.is_allowed("client1"))
+        # 4th request must be rejected
+        self.assertFalse(limiter.is_allowed("client1"))
+        # Different client should still be allowed
+        self.assertTrue(limiter.is_allowed("client2"))
+
+
+class TestDNSRebindingProtection(unittest.TestCase):
+    """Test DNS rebinding and camera stream validation."""
+
+    def test_stream_url_private_ip_blocked_when_disallowed(self):
+        from safetv.cctv import validate_stream_url
+        with self.assertRaises(PermissionError):
+            validate_stream_url("rtsp://127.0.0.1:554/live", allow_private=False)
+
+    def test_stream_url_local_file_allowed(self):
+        from safetv.cctv import validate_stream_url
+        # Should not raise
+        validate_stream_url("data/raw/test.mp4", allow_private=False)
+        validate_stream_url("file:///test.mp4", allow_private=False)
+
+
 if __name__ == "__main__":
     unittest.main()

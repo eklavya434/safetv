@@ -7,13 +7,16 @@ Enforces a consistent timestamp model (camera-relative seconds + wall-clock capt
 
 import collections
 import datetime
+import ipaddress
 import json
 import logging
 import os
+import socket
 import threading
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -55,6 +58,35 @@ class CameraConfig:
         return asdict(self)
 
 
+def validate_stream_url(url: str, allow_private: bool = False) -> None:
+    """Validates camera source URL against DNS rebinding and SSRF."""
+    if not url:
+        raise ValueError("Camera source URL cannot be empty.")
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        # Local file path or relative path
+        return
+    scheme = parsed.scheme.lower()
+    if scheme not in ("rtsp", "rtsps", "file"):
+        raise ValueError(f"Unsupported camera protocol: '{scheme}'. Only rtsp, rtsps, and file are allowed.")
+    if scheme in ("rtsp", "rtsps"):
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError(f"Invalid camera URL without hostname: '{url}'")
+        try:
+            addr_info = socket.getaddrinfo(hostname, parsed.port or 554, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            for family, socktype, proto, canonname, sockaddr in addr_info:
+                ip_str = sockaddr[0]
+                ip_obj = ipaddress.ip_address(ip_str)
+                if not allow_private and (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved or ip_obj.is_multicast):
+                    raise PermissionError(
+                        f"Connection to private/internal network IP '{ip_str}' is blocked by SSRF prevention. "
+                        "Set SAFETV_ALLOW_PRIVATE_CAMERAS=true to allow internal IP surveillance streams."
+                    )
+        except socket.gaierror as e:
+            raise IOError(f"Could not resolve camera hostname '{hostname}': {e}")
+
+
 class RTSPStreamWorker:
     """
     Dedicated background worker thread for an active RTSP camera feed.
@@ -82,7 +114,7 @@ class RTSPStreamWorker:
         # Thread management & state
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         # Rolling frame ring buffer: stores BufferedFrame
         buffer_len = max(90, int(self.camera.target_fps * self.camera.buffer_seconds))
@@ -131,6 +163,8 @@ class RTSPStreamWorker:
             cap = None
             try:
                 self.status = "CONNECTING"
+                allow_private = os.getenv("SAFETV_ALLOW_PRIVATE_CAMERAS", "true").lower() in ("true", "1", "yes")
+                validate_stream_url(self.camera.source_url, allow_private=allow_private)
                 cap = cv2.VideoCapture(self.camera.source_url)
                 if not cap.isOpened():
                     raise IOError(f"Could not connect to video source: {self.camera.source_url}")
@@ -215,7 +249,7 @@ class RTSPStreamWorker:
                 self.status = "RECONNECTING"
                 backoff_sec = min(60.0, self.camera.reconnect_interval_sec * (2 ** min(self.consecutive_failures - 1, 5)))
                 logger.info(f"Reconnecting camera '{self.camera.camera_id}' in {backoff_sec:.1f}s (attempt {self.consecutive_failures}/{self.max_reconnect_attempts})")
-                time.sleep(backoff_sec)
+                self._stop_event.wait(timeout=backoff_sec)
 
         self.status = "STOPPED"
 
@@ -306,6 +340,17 @@ class RTSPStreamWorker:
                 camera_name=self.camera.name
             )
 
+    def is_healthy(self, max_stale_seconds: float = 30.0) -> bool:
+        """Returns True if worker is running and receiving frames within heartbeat threshold."""
+        with self._lock:
+            if self.status != "RUNNING":
+                return False
+            now = time.time()
+            if self.last_frame_time is None:
+                start = self.session_start_time or time.monotonic()
+                return (time.monotonic() - start) < max_stale_seconds
+            return (now - self.last_frame_time) < max_stale_seconds
+
     def get_status(self) -> dict:
         """Return live telemetry snapshot."""
         with self._lock:
@@ -325,6 +370,7 @@ class RTSPStreamWorker:
                 "queue_depth": len(self._frame_buffer),
                 "frames_dropped": self.frames_dropped,
                 "consecutive_failures": self.consecutive_failures,
+                "is_healthy": self.is_healthy(),
             }
 
 
@@ -342,7 +388,7 @@ class CameraManager:
         self.registry_file = registry_file
         self.pipeline_config = pipeline_config or SafeTVConfig()
         self.alert_dispatcher = alert_dispatcher or AlertDispatcher()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.workers: Dict[str, RTSPStreamWorker] = {}
         self.cameras: Dict[str, CameraConfig] = {}
         self._load_registry()

@@ -4,6 +4,7 @@ Tests for model checkpoint integrity, manifest validation, and fail-closed behav
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -93,6 +94,81 @@ class TestModelIntegrity(unittest.TestCase):
             manifest = json.load(f)
         expected = manifest.get("checkpoint_sha256", "").lower()
         self.assertEqual(actual_hash, expected, "Manifest SHA-256 does not match checkpoint file")
+
+    def test_corrupted_checkpoint_byte_flip_refused(self):
+        """Flipping a single byte in the checkpoint must cause SHA-256 validation failure and reject loading."""
+        temp_dir = tempfile.mkdtemp()
+        try:
+            temp_ckpt = os.path.join(temp_dir, "best_model.pth")
+            temp_manifest = os.path.join(temp_dir, "manifest.json")
+            shutil.copyfile(self.checkpoint_path, temp_ckpt)
+            shutil.copyfile(self.manifest_path, temp_manifest)
+
+            # Flip one byte in the checkpoint copy
+            with open(temp_ckpt, "r+b") as f:
+                f.seek(100)
+                b = f.read(1)
+                f.seek(100)
+                f.write(bytes([(b[0] ^ 0xFF)]))
+
+            cfg = ModelConfig(checkpoint_path=temp_ckpt)
+            model = VideoActionClassifier(cfg)
+            with self.assertRaises(ModelNotReadyError):
+                model.load_checkpoint(temp_ckpt)
+            self.assertFalse(model.is_ready)
+            self.assertEqual(model.provenance, "integrity_failure")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_missing_manifest_refused(self):
+        """Loading a checkpoint without a companion manifest.json must be refused."""
+        temp_dir = tempfile.mkdtemp()
+        try:
+            temp_ckpt = os.path.join(temp_dir, "best_model.pth")
+            shutil.copyfile(self.checkpoint_path, temp_ckpt)
+            # Do NOT copy manifest.json
+
+            cfg = ModelConfig(checkpoint_path=temp_ckpt)
+            model = VideoActionClassifier(cfg)
+            with self.assertRaises(ModelNotReadyError):
+                model.load_checkpoint(temp_ckpt)
+            self.assertFalse(model.is_ready)
+            self.assertEqual(model.provenance, "missing_manifest")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_nan_weights_refused(self):
+        """A checkpoint containing non-finite (NaN/Inf) weights must be rejected."""
+        import torch
+        temp_dir = tempfile.mkdtemp()
+        try:
+            temp_ckpt = os.path.join(temp_dir, "best_model.pth")
+            temp_manifest = os.path.join(temp_dir, "manifest.json")
+
+            state = torch.load(self.checkpoint_path, map_location="cpu", weights_only=True)
+            first_key = next(iter(state.keys()))
+            state[first_key][0] = float("nan")
+            torch.save(state, temp_ckpt)
+
+            sha256 = hashlib.sha256()
+            with open(temp_ckpt, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    sha256.update(chunk)
+
+            with open(self.manifest_path, "r", encoding="utf-8") as f:
+                manifest_data = json.load(f)
+            manifest_data["checkpoint_sha256"] = sha256.hexdigest()
+            with open(temp_manifest, "w", encoding="utf-8") as f:
+                json.dump(manifest_data, f)
+
+            cfg = ModelConfig(checkpoint_path=temp_ckpt)
+            model = VideoActionClassifier(cfg)
+            with self.assertRaises(ModelNotReadyError):
+                model.load_checkpoint(temp_ckpt)
+            self.assertFalse(model.is_ready)
+            self.assertEqual(model.provenance, "corrupted_checkpoint")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
