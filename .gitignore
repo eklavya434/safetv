@@ -41,6 +41,7 @@ ENV/
 # Output reports & local test artifacts
 incident_report.json
 benchmark_report.json
+robustness_report.json
 *.log
 evidence/
 uploads/
