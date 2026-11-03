@@ -1,0 +1,17 @@
+{
+  "model_name": "SafeTV Violence Detector",
+  "model_version": "1.0.0",
+  "architecture": "r2plus1d_18",
+  "num_classes": 2,
+  "input_shape": [3, 16, 112, 112],
+  "class_mapping": {
+    "0": "non_violence",
+    "1": "violence"
+  },
+  "checkpoint_file": "best_model.pth",
+  "checkpoint_sha256": "8836abc8378352e9de07e948b673bda20039425acdd0272b49ccda8cc69d629f",
+  "calibration_status": "TRAINED_UNCALIBRATED",
+  "training_notes": "Fine-tuned on real-world surveillance fight clips. Small dataset (26 clips). Human verification required for all alerts.",
+  "is_production_ready": false,
+  "created_at": "2026-11-03"
+}

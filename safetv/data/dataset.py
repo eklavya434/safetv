@@ -76,10 +76,9 @@ class SafeTVVideoDataset(Dataset):
         tensor_np = self.preprocessor.extract_clip_tensor(v_path, start_frame=start_f)
 
         if tensor_np is None:
-            # Fallback zero tensor if video decoding encounters unexpected read issue
-            tensor_np = np.zeros(
-                (3, self.config.num_frames, self.config.target_height, self.config.target_width),
-                dtype=np.float32
+            raise RuntimeError(
+                f"Failed to decode video frames for clip '{entry.get('clip_id', idx)}' at path '{v_path}'. "
+                "Corrupted frames cannot be silently replaced with zero tensors."
             )
 
         # Training data augmentation

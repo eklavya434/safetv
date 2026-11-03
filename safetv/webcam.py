@@ -51,6 +51,12 @@ class WebcamSession:
         Appends new frames to persistent rolling window buffer, runs inference
         on newly completed temporal windows, and updates incident state machine.
         """
+        if not self.model.is_ready:
+            raise ModelNotReadyError(
+                f"Webcam inference disabled: {self.model.model_status_message}. "
+                "A valid trained checkpoint must be loaded."
+            )
+
         with self.lock:
             self.last_activity = time.time()
             completed_incidents: List[Incident] = []
@@ -70,11 +76,8 @@ class WebcamSession:
 
                     tensor_4d = self.extractor._resize_and_normalize(sampled)
 
-                    try:
-                        preds = self.model.predict_window(tensor_4d, allow_uncalibrated=not self.model.is_ready)
-                        raw_prob = float(preds["violence_prob"])
-                    except ModelNotReadyError:
-                        raw_prob = 0.0
+                    preds = self.model.predict_window(tensor_4d, allow_uncalibrated=False)
+                    raw_prob = float(preds["violence_prob"])
 
                     smoothed_prob = self.smoother.update(raw_prob)
                     self.last_prob = round(smoothed_prob, 4)

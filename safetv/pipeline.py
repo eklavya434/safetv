@@ -120,9 +120,16 @@ class SafeTVPipeline:
         """
         Process an in-memory sequence of RGB uint8 video frames.
         reset_state: If False (e.g. streaming/webcam session), preserves temporal smoother and state machine.
+        Raises ModelNotReadyError if no valid trained checkpoint is loaded (fail-closed).
         """
         if reset_state:
             self.reset()
+
+        if not self.model.is_ready:
+            raise ModelNotReadyError(
+                f"SafeTV pipeline inference is disabled: {self.model.model_status_message}. "
+                "A valid trained checkpoint must be loaded before processing video."
+            )
 
         start_exec = time.time()
         timeline: List[WindowResult] = []
@@ -133,26 +140,20 @@ class SafeTVPipeline:
         last_end_time = 0.0
 
         for window in self.extractor.extract_from_frames(frames, fps=fps):
-            # 1. Genuine AI model inference (allow_uncalibrated=True if running uncalibrated baseline)
-            try:
-                preds = self.model.predict_window(window.tensor, allow_uncalibrated=not self.model.is_ready)
-                raw_prob = float(preds["violence_prob"])
-            except ModelNotReadyError:
-                raw_prob = 0.0
+            # 1. Genuine AI model inference — strict, no silent fallback
+            preds = self.model.predict_window(window.tensor, allow_uncalibrated=False)
+            raw_prob = float(preds["violence_prob"])
 
             # 2. Temporal smoothing
             smoothed_prob = self.smoother.update(raw_prob)
 
-            # 3. Incident classification (only if model is trained and ready)
-            if self.model.is_ready:
-                self.incident_classifier.process_window(
-                    smoothed_prob=smoothed_prob,
-                    timestamp_sec=window.center_time_sec,
-                    frame_idx=window.end_frame
-                )
-                is_active = self.incident_classifier.is_incident_active
-            else:
-                is_active = False
+            # 3. Incident classification
+            self.incident_classifier.process_window(
+                smoothed_prob=smoothed_prob,
+                timestamp_sec=window.center_time_sec,
+                frame_idx=window.end_frame
+            )
+            is_active = self.incident_classifier.is_incident_active
 
             label = "VIOLENCE" if smoothed_prob >= self.config.incident.onset_threshold else "NORMAL"
 
@@ -176,13 +177,13 @@ class SafeTVPipeline:
             window_idx += 1
 
         # Finalize open incidents if batch is finalizing
-        if reset_state and self.model.is_ready:
+        if reset_state:
             final_incidents = self.incident_classifier.finalize()
         else:
             final_incidents = list(self.incident_classifier.completed_incidents)
 
         # 4. Extract buffered evidence clips
-        if self.config.evidence.save_evidence_clips and self.model.is_ready:
+        if self.config.evidence.save_evidence_clips:
             for inc in final_incidents:
                 if not inc.evidence_path:
                     self.evidence_extractor.extract_clip_from_frames(
@@ -221,9 +222,17 @@ class SafeTVPipeline:
     ) -> PipelineReport:
         """
         Process a video file on disk, automatically slicing evidence clips for confirmed incidents.
+        Raises ModelNotReadyError if no valid trained checkpoint is loaded (fail-closed).
         """
         self.reset()
         start_exec = time.time()
+
+        if not self.model.is_ready:
+            raise ModelNotReadyError(
+                f"SafeTV pipeline inference is disabled: {self.model.model_status_message}. "
+                "A valid trained checkpoint must be loaded before processing video."
+            )
+
         timeline: List[WindowResult] = []
         raw_probs: List[float] = []
         smoothed_probs: List[float] = []
@@ -234,11 +243,8 @@ class SafeTVPipeline:
 
         for window in self.extractor.extract_from_file(video_path, max_duration_sec=max_duration_sec):
             fps_detected = window.fps
-            try:
-                preds = self.model.predict_window(window.tensor, allow_uncalibrated=not self.model.is_ready)
-                raw_prob = float(preds["violence_prob"])
-            except ModelNotReadyError:
-                raw_prob = 0.0
+            preds = self.model.predict_window(window.tensor, allow_uncalibrated=False)
+            raw_prob = float(preds["violence_prob"])
 
             smoothed_prob = self.smoother.update(raw_prob)
 

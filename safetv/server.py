@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import FastAPI, Depends, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -41,12 +41,16 @@ app = FastAPI(
     description="Spatiotemporal AI violence recognition, multi-camera management, and incident response platform.",
 )
 
+import os as _os
+_cors_origins_raw = _os.getenv("SAFETV_ALLOWED_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000")
+_cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key", "Authorization"],
 )
 
 # Core subsystems
@@ -172,7 +176,7 @@ async def get_model_health():
 
 
 @app.post("/api/analyze/upload")
-async def upload_and_analyze_video(file: UploadFile = File(...)):
+async def upload_and_analyze_video(file: UploadFile = File(...), _: None = Depends(verify_api_key)):
     """
     Upload a surveillance video recording, execute genuine AI analysis,
     generate incident records, extract forensic MP4 evidence clips, and trigger alerts.
@@ -194,7 +198,11 @@ async def upload_and_analyze_video(file: UploadFile = File(...)):
                     raise HTTPException(status_code=413, detail=f"File exceeds maximum upload size of {MAX_UPLOAD_BYTES // (1024*1024)} MB.")
                 buffer.write(chunk)
 
-        report = pipeline.process_file(temp_path)
+        try:
+            report = pipeline.process_file(temp_path)
+        except ModelNotReadyError as e:
+            raise HTTPException(status_code=503, detail=f"Model not ready: {str(e)}")
+
         report_dict = report.to_dict()
 
         if pipeline.model.is_ready:
@@ -227,19 +235,23 @@ async def upload_and_analyze_video(file: UploadFile = File(...)):
             "report": report_dict,
         }
     finally:
-        pass
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
 
 
 # Persistent Webcam Session Endpoints
 @app.post("/api/webcam/session/start")
-async def start_webcam_session():
+async def start_webcam_session(_: None = Depends(verify_api_key)):
     """Start a stateful continuous webcam monitoring session."""
     session_id = webcam_session_manager.create_session()
     return {"success": True, "session_id": session_id}
 
 
 @app.post("/api/webcam/session/stop")
-async def stop_webcam_session(payload: dict):
+async def stop_webcam_session(payload: dict, _: None = Depends(verify_api_key)):
     """Stop session and finalize any concluding incidents."""
     session_id = payload.get("session_id")
     if not session_id:
@@ -252,7 +264,7 @@ async def stop_webcam_session(payload: dict):
 
 
 @app.post("/api/analyze/stream-window")
-async def analyze_stream_window(payload: WebcamWindowPayload):
+async def analyze_stream_window(payload: WebcamWindowPayload, _: None = Depends(verify_api_key)):
     """
     Process rolling temporal window frames sent by the live laptop webcam.
     Preserves stateful smoothing and incident detection across batches.
@@ -276,7 +288,10 @@ async def analyze_stream_window(payload: WebcamWindowPayload):
 
     # Use persistent session to prevent state wipe between chunked requests
     session = webcam_session_manager.get_or_create_session(payload.session_id)
-    prob, is_active, completed_incidents = session.add_frames_and_infer(decoded_frames, fps=payload.fps or 15.0)
+    try:
+        prob, is_active, completed_incidents = session.add_frames_and_infer(decoded_frames, fps=payload.fps or 15.0)
+    except ModelNotReadyError as e:
+        raise HTTPException(status_code=503, detail=f"Model not ready: {str(e)}")
 
     incidents_dicts = []
     for inc in completed_incidents:
@@ -305,6 +320,39 @@ async def analyze_stream_window(payload: WebcamWindowPayload):
     }
 
 
+import ipaddress
+from urllib.parse import urlparse
+
+
+def _validate_camera_url(url: str) -> None:
+    """Prevent SSRF by validating camera source URLs."""
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    # Empty scheme represents local file path on disk (e.g. data/raw/video.mp4)
+    if scheme != "":
+        allowed_schemes = {"rtsp", "rtsps", "file"}
+        if scheme not in allowed_schemes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported camera URL scheme '{parsed.scheme}'. Only rtsp://, rtsps://, file:// or local file paths are allowed."
+            )
+    hostname = parsed.hostname or ""
+    if scheme in {"rtsp", "rtsps"}:
+        allowed_hosts_raw = os.getenv("SAFETV_ALLOWED_CAMERA_HOSTS", "")
+        allowed_hosts = {h.strip() for h in allowed_hosts_raw.split(",") if h.strip()}
+        if hostname not in allowed_hosts:
+            try:
+                addr = ipaddress.ip_address(hostname)
+                if addr.is_loopback or addr.is_private or addr.is_link_local:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Camera URL host '{hostname}' is a private/loopback address. "
+                               "Set SAFETV_ALLOWED_CAMERA_HOSTS to allow this host."
+                    )
+            except ValueError:
+                pass
+
+
 # CCTV Multi-Camera Endpoints
 @app.get("/api/cameras")
 async def list_cameras():
@@ -313,8 +361,9 @@ async def list_cameras():
 
 
 @app.post("/api/cameras")
-async def register_camera(payload: CameraPayload):
+async def register_camera(payload: CameraPayload, _: None = Depends(verify_api_key)):
     """Register a new CCTV RTSP or file stream."""
+    _validate_camera_url(payload.source_url)
     cam = camera_manager.register_camera(
         camera_id=payload.camera_id,
         name=payload.name,
@@ -326,7 +375,7 @@ async def register_camera(payload: CameraPayload):
 
 
 @app.delete("/api/cameras/{camera_id}")
-async def delete_camera(camera_id: str):
+async def delete_camera(camera_id: str, _: None = Depends(verify_api_key)):
     """Remove a camera from the active registry."""
     success = camera_manager.delete_camera(camera_id)
     if not success:
@@ -335,7 +384,7 @@ async def delete_camera(camera_id: str):
 
 
 @app.post("/api/cameras/{camera_id}/start")
-async def start_camera(camera_id: str):
+async def start_camera(camera_id: str, _: None = Depends(verify_api_key)):
     """Start RTSP ingestion and AI surveillance worker for a camera."""
     success = camera_manager.start_camera(camera_id)
     if not success:
@@ -344,7 +393,7 @@ async def start_camera(camera_id: str):
 
 
 @app.post("/api/cameras/{camera_id}/stop")
-async def stop_camera(camera_id: str):
+async def stop_camera(camera_id: str, _: None = Depends(verify_api_key)):
     """Stop RTSP worker for a camera."""
     success = camera_manager.stop_camera(camera_id)
     return {"success": success}
@@ -358,7 +407,7 @@ async def list_alerts():
 
 
 @app.post("/api/alerts/test")
-async def trigger_test_alert():
+async def trigger_test_alert(_: None = Depends(verify_api_key)):
     """Trigger a sample security alert to test webhook / notification channels."""
     test_incident = Incident(
         incident_id=999,
@@ -392,16 +441,24 @@ async def get_evidence_clip(filename: str):
     Strict path-traversal prevention: restricts access exclusively inside EVIDENCE_DIR.
     """
     safe_filename = os.path.basename(filename)
-    target_path = os.path.abspath(os.path.join(EVIDENCE_DIR, safe_filename))
+    if any(c in safe_filename for c in ['/', '\\', '\x00', '..', ':']):
+        raise HTTPException(status_code=400, detail="Invalid filename.")
 
-    if not target_path.startswith(EVIDENCE_DIR) or not os.path.exists(target_path):
+    target_path = os.path.realpath(os.path.join(EVIDENCE_DIR, safe_filename))
+    evidence_real = os.path.realpath(EVIDENCE_DIR)
+
+    try:
+        common = os.path.commonpath([target_path, evidence_real])
+        if common != evidence_real or not os.path.exists(target_path):
+            raise HTTPException(status_code=404, detail="Evidence clip not found or access denied.")
+    except ValueError:
         raise HTTPException(status_code=404, detail="Evidence clip not found or access denied.")
 
     return FileResponse(target_path, media_type="video/mp4", filename=safe_filename)
 
 
 @app.post("/api/incidents/{incident_id}/review")
-async def review_incident(incident_id: str, payload: ReviewPayload):
+async def review_incident(incident_id: str, payload: ReviewPayload, _: None = Depends(verify_api_key)):
     """Log security operator verification decision (TRUE_POSITIVE, FALSE_POSITIVE, UNCERTAIN)."""
     record = review_manager.log_review(
         incident_id=incident_id,
@@ -419,7 +476,7 @@ async def review_incident(incident_id: str, payload: ReviewPayload):
 
 
 @app.post("/api/incidents/export-dataset")
-async def export_reviewed_dataset():
+async def export_reviewed_dataset(_: None = Depends(verify_api_key)):
     """
     Export human-reviewed incidents (TRUE_POSITIVE vs FALSE_POSITIVE) into a curated dataset
     directory for future model retraining cycles.
@@ -458,8 +515,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div>
         <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-2">
           SafeTV
-          <span id="prodBadge" class="text-xs font-semibold px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-            PROD ENGINE
+          <span id="prodBadge" class="text-xs font-semibold px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
+            RESEARCH MODE
           </span>
         </h1>
         <p class="text-xs text-slate-400">Video Action Recognition & Incident Alert System</p>
@@ -1397,6 +1454,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         } else {
           const hashShort = data.model.checkpoint_hash ? ` [${data.model.checkpoint_hash.substring(0, 7)}]` : '';
           document.getElementById('modelArchText').textContent = `${data.model.architecture.toUpperCase()} (TRAINED)${hashShort}`;
+          const prodBadge = document.getElementById('prodBadge');
+          if (data.model && data.model.is_production_ready) {
+            prodBadge.textContent = 'PROD ENGINE';
+            prodBadge.className = 'text-xs font-semibold px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20';
+          } else {
+            prodBadge.textContent = 'RESEARCH MODE';
+            prodBadge.className = 'text-xs font-semibold px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20';
+          }
         }
       } catch (e) {}
     }

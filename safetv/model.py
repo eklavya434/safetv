@@ -139,8 +139,34 @@ class VideoActionClassifier:
         # Compute SHA-256 hash for integrity tracking
         self.checkpoint_hash = self._compute_file_hash(checkpoint_path)
 
-        # Attempt to load class mapping if present in checkpoint directory
+        # Validate against manifest if available
         ckpt_dir = os.path.dirname(checkpoint_path)
+        manifest_path = os.path.join(ckpt_dir, "manifest.json")
+        if os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as mf:
+                    manifest = json.load(mf)
+                expected_hash = manifest.get("checkpoint_sha256", "").lower()
+                if expected_hash and self.checkpoint_hash.lower() != expected_hash:
+                    err_msg = (
+                        f"Checkpoint integrity failure: SHA-256 mismatch. "
+                        f"Expected {expected_hash[:12]}..., got {self.checkpoint_hash[:12]}... "
+                        "Checkpoint may be corrupted or tampered."
+                    )
+                    logger.error(err_msg)
+                    self.is_trained = False
+                    self.is_ready = False
+                    self.provenance = "integrity_failure"
+                    self.model_status_message = err_msg
+                    raise ModelNotReadyError(err_msg)
+
+                manifest_mapping = manifest.get("class_mapping", {})
+                if manifest_mapping:
+                    self.class_mapping = {int(k): v for k, v in manifest_mapping.items()}
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Could not read manifest.json: {e}")
+
+        # Attempt to load class mapping if present in checkpoint directory (overrides manifest if present)
         class_map_file = os.path.join(ckpt_dir, "class_mapping.json")
         if os.path.exists(class_map_file):
             try:
@@ -174,6 +200,17 @@ class VideoActionClassifier:
 
             self.model.load_state_dict(state, strict=True)
             self.model.eval()
+
+            # Verify loaded weights are strictly finite (detect corrupted/NaN checkpoints)
+            all_finite = all(torch.isfinite(p).all().item() for p in self.model.parameters())
+            if not all_finite:
+                err_msg = "Checkpoint contains non-finite weights (NaN/Inf). Checkpoint is corrupted."
+                logger.error(err_msg)
+                self.is_trained = False
+                self.is_ready = False
+                self.provenance = "corrupted_checkpoint"
+                self.model_status_message = err_msg
+                raise ModelNotReadyError(err_msg)
 
             self.is_trained = True
             self.is_ready = True
