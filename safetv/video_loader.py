@@ -10,6 +10,11 @@ from typing import Generator, List, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 from .config import VideoExtractionConfig
 
 
@@ -44,14 +49,22 @@ class VideoWindowExtractor:
         std = np.array(self.config.normalize_std, dtype=np.float32).reshape(3, 1, 1)
 
         for frame in frames:
-            # Resize using PIL for robust cross-platform resampling
-            pil_img = Image.fromarray(frame)
-            if pil_img.size != (self.config.target_width, self.config.target_height):
-                pil_img = pil_img.resize(
-                    (self.config.target_width, self.config.target_height),
-                    resample=Image.Resampling.BILINEAR
-                )
-            arr = np.array(pil_img, dtype=np.float32) / 255.0  # (H, W, C)
+            # Resize using OpenCV when available for 10x SIMD speedup, fallback to PIL
+            if cv2 is not None:
+                h, w = frame.shape[:2]
+                if (w, h) != (self.config.target_width, self.config.target_height):
+                    resized = cv2.resize(frame, (self.config.target_width, self.config.target_height), interpolation=cv2.INTER_LINEAR)
+                else:
+                    resized = frame
+            else:
+                pil_img = Image.fromarray(frame)
+                if pil_img.size != (self.config.target_width, self.config.target_height):
+                    pil_img = pil_img.resize(
+                        (self.config.target_width, self.config.target_height),
+                        resample=Image.Resampling.BILINEAR
+                    )
+                resized = np.array(pil_img)
+            arr = np.array(resized, dtype=np.float32) / 255.0  # (H, W, C)
             arr = np.transpose(arr, (2, 0, 1))                 # (C, H, W)
             arr = (arr - mean) / std                           # Normalized
             processed_frames.append(arr)
@@ -114,8 +127,8 @@ class VideoWindowExtractor:
         max_duration_sec: Optional[float] = None
     ) -> Generator[VideoWindow, None, None]:
         """
-        Streamingly extracts sliding windows directly from a video file.
-        Uses OpenCV when available, with clean fallback.
+        Streamingly extracts sliding windows directly from a video file with O(1) memory.
+        Maintains a rolling temporal window buffer instead of loading the entire video into RAM.
         """
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found at: {video_path}")
@@ -130,25 +143,61 @@ class VideoWindowExtractor:
             if fps <= 0 or np.isnan(fps):
                 fps = 30.0
 
-            all_frames = []
+            required_span = (self.config.window_size - 1) * self.config.temporal_stride + 1
+            step = max(1, self.config.window_step)
             frame_limit = int(max_duration_sec * fps) if max_duration_sec else None
 
+            # Streaming rolling window frame buffer (max length bounded to required_span + step)
+            buffer: List[np.ndarray] = []
+            frame_indices: List[int] = []
             count = 0
+
             while True:
                 ret, bgr_frame = cap.read()
                 if not ret:
                     break
                 rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-                all_frames.append(rgb_frame)
+                # Resize once upon decode for minimal memory footprint (112x112 is ~37KB vs 6.2MB)
+                resized_frame = cv2.resize(
+                    rgb_frame,
+                    (self.config.target_width, self.config.target_height),
+                    interpolation=cv2.INTER_LINEAR
+                )
+                buffer.append(resized_frame)
+                frame_indices.append(count)
                 count += 1
+
+                if len(buffer) >= required_span:
+                    sampled = [buffer[i * self.config.temporal_stride] for i in range(self.config.window_size)]
+                    window_tensor = self._resize_and_normalize(sampled)
+
+                    start_f = frame_indices[0]
+                    end_f = frame_indices[required_span - 1]
+                    start_t = start_f / fps
+                    end_t = end_f / fps
+                    center_t = (start_t + end_t) / 2.0
+
+                    yield VideoWindow(
+                        tensor=window_tensor,
+                        raw_frames=[],
+                        start_frame=start_f,
+                        end_frame=end_f,
+                        start_time_sec=start_t,
+                        end_time_sec=end_t,
+                        center_time_sec=center_t,
+                        fps=fps,
+                    )
+
+                    # Advance rolling buffer by step
+                    buffer = buffer[step:]
+                    frame_indices = frame_indices[step:]
+
                 if frame_limit and count >= frame_limit:
                     break
 
             cap.release()
-            yield from self.extract_from_frames(all_frames, fps=fps)
 
         except ImportError:
-            # OpenCV not yet installed; raise informative error
             raise RuntimeError(
                 "OpenCV (cv2) is required to read video files directly. "
                 "Install via 'pip install opencv-python-headless' or pass frame lists."

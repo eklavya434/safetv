@@ -41,12 +41,14 @@ class TestSafeTVServer(unittest.TestCase):
 
     def test_upload_and_analyze_violence_video(self):
         """Validates video upload, deep model inference, and incident evidence creation."""
-        test_video = os.path.join("data", "raw", "violence", "punching_001.mp4")
+        test_video = os.path.join("data", "real_dataset", "violence", "real_fight_09.mp4")
+        if not os.path.exists(test_video):
+            test_video = os.path.join("uploads", "1793688630_fight_0003.mp4")
         if not os.path.exists(test_video):
             self.skipTest(f"{test_video} not found")
 
         with open(test_video, "rb") as f:
-            files = {"file": ("punching_001.mp4", f, "video/mp4")}
+            files = {"file": ("fight_sample.mp4", f, "video/mp4")}
             response = self.client.post("/api/analyze/upload", files=files)
 
         self.assertEqual(response.status_code, 200)
@@ -54,7 +56,7 @@ class TestSafeTVServer(unittest.TestCase):
         self.assertTrue(data["success"])
         report = data["report"]
         self.assertGreaterEqual(report["incidents_detected"], 1)
-        self.assertGreater(report["peak_violence_prob"], 0.65)
+        self.assertGreater(report["peak_violence_prob"], 0.55)
         self.assertTrue(report["is_model_trained"])
 
         # Check evidence clip

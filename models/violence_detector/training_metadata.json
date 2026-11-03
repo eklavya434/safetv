@@ -1,16 +1,16 @@
 {
   "model_version": "1.0.0",
-  "training_date": "2026-11-03T09:36:04.572307",
+  "training_date": "2026-11-03T14:08:49.255675",
   "architecture": "r2plus1d_18",
   "training_parameters": {
     "architecture": "r2plus1d_18",
     "pretrained_backbone": true,
-    "manifest_csv": "data/annotations/labels.csv",
+    "manifest_csv": "data/real_dataset/annotations/labels.csv",
     "output_dir": "models/violence_detector",
     "epochs": 5,
     "batch_size": 4,
     "learning_rate": 0.001,
-    "backbone_learning_rate": 5e-05,
+    "backbone_learning_rate": 2e-05,
     "weight_decay": 0.0001,
     "gradient_clip_norm": 1.0,
     "early_stopping_patience": 4,
@@ -21,10 +21,10 @@
     "random_seed": 42
   },
   "best_val_metrics": {
-    "total_samples": 7,
-    "true_positives": 3,
+    "total_samples": 3,
+    "true_positives": 1,
     "false_positives": 0,
-    "true_negatives": 4,
+    "true_negatives": 2,
     "false_negatives": 0,
     "accuracy": 1.0,
     "precision": 1.0,
@@ -38,31 +38,31 @@
   },
   "total_epochs_trained": 2,
   "dataset_counts": {
-    "train_clips": 29,
-    "val_clips": 7,
-    "test_clips": 4
+    "train_clips": 18,
+    "val_clips": 3,
+    "test_clips": 5
   },
   "training_history": [
     {
       "epoch": 1,
-      "train_loss": 0.6633023491927555,
-      "train_acc": 0.5,
-      "val_loss": 0.6687384758676801,
-      "val_f1": 0.6,
-      "val_acc": 0.42857142857142855
+      "train_loss": 0.7428925186395645,
+      "train_acc": 0.4375,
+      "val_loss": 0.6183763742446899,
+      "val_f1": 0.0,
+      "val_acc": 0.6666666666666666
     },
     {
       "epoch": 2,
-      "train_loss": 0.518287433045251,
-      "train_acc": 0.7857142857142857,
-      "val_loss": 0.37095380255154203,
+      "train_loss": 0.6091171354055405,
+      "train_acc": 0.8125,
+      "val_loss": 0.4993550777435303,
       "val_f1": 1.0,
       "val_acc": 1.0
     }
   ],
   "unseen_test_evaluation": {
-    "total_samples": 4,
-    "true_positives": 1,
+    "total_samples": 5,
+    "true_positives": 2,
     "false_positives": 0,
     "true_negatives": 3,
     "false_negatives": 0,
@@ -75,21 +75,21 @@
     "false_alarm_rate": 0.0,
     "mean_detection_latency_sec": null,
     "mean_temporal_iou": null,
-    "test_loss": 0.3847,
-    "latency_per_clip_ms": 1065.44,
+    "test_loss": 0.4451,
+    "latency_per_clip_ms": 1216.78,
     "model_size_mb": 119.82,
     "subcategory_breakdown": {
-      "punching": {
+      "physical_fight": {
+        "correct": 2,
+        "incorrect": 0,
+        "total": 2
+      },
+      "hallway_walking": {
         "correct": 1,
         "incorrect": 0,
         "total": 1
       },
-      "running": {
-        "correct": 1,
-        "incorrect": 0,
-        "total": 1
-      },
-      "hugging": {
+      "exercise": {
         "correct": 2,
         "incorrect": 0,
         "total": 2

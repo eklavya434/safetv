@@ -128,11 +128,14 @@ def load_all_incidents() -> List[Dict]:
 @app.get("/api/status")
 async def get_system_status():
     """Return AI engine status, model provenance, readiness, and hardware configuration."""
+    health = pipeline.model.get_health_report()
     model_ready = pipeline.model.is_ready
     return {
         "status": "ONLINE",
         "version": __version__,
         "model_status": "MODEL_READY" if model_ready else "MODEL_NOT_READY",
+        "health_check": health,
+        "warning": None if model_ready else "Trained model checkpoint unavailable. Violence probabilities cannot be computed reliably.",
         "model": {
             "architecture": pipeline.config.model.architecture,
             "is_trained": pipeline.model.is_trained,
@@ -141,6 +144,9 @@ async def get_system_status():
             "checkpoint": pipeline.model.loaded_checkpoint,
             "checkpoint_hash": pipeline.model.checkpoint_hash,
             "class_mapping": pipeline.model.class_mapping,
+            "calibration_status": health["calibration_status"],
+            "is_suitable_for_evaluation": health["is_suitable_for_evaluation"],
+            "is_production_ready": health["is_production_ready"],
             "device": str(pipeline.model.device),
             "status_message": pipeline.model.model_status_message,
         },
@@ -157,6 +163,12 @@ async def get_system_status():
             "total_incidents_logged": len(glob.glob(os.path.join(EVIDENCE_DIR, "*_metadata.json"))),
         },
     }
+
+
+@app.get("/api/model/health")
+async def get_model_health():
+    """Detailed health check endpoint for AI video action classifier."""
+    return pipeline.model.get_health_report()
 
 
 @app.post("/api/analyze/upload")

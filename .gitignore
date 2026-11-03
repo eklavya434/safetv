@@ -50,7 +50,9 @@ uploads/
 data/raw/
 data/processed/
 data/reviewed_export/
+data/real_dataset/**/*.mp4
 !data/annotations/
+!data/real_dataset/annotations/
 
 # IDEs
 .vscode/

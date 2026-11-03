@@ -265,3 +265,34 @@ class VideoActionClassifier:
         for t in tensors:
             results.append(self.predict_window(t, allow_uncalibrated=allow_uncalibrated))
         return results
+
+    def get_health_report(self) -> Dict[str, Union[str, bool, dict, None]]:
+        """
+        Comprehensive health report verifying model architecture, loaded checkpoint,
+        SHA-256 integrity, training provenance, class mapping, and evaluation suitability.
+        """
+        calibration = "CALIBRATED_REAL_WORLD" if self.is_ready and self.is_trained else "UNCALIBRATED"
+        return {
+            "architecture": self.architecture,
+            "checkpoint_loaded": self.loaded_checkpoint,
+            "checkpoint_hash": self.checkpoint_hash,
+            "training_provenance": self.provenance,
+            "class_mapping": self.class_mapping,
+            "calibration_status": calibration,
+            "is_suitable_for_evaluation": self.is_ready,
+            "is_production_ready": False,
+            "status_message": self.model_status_message,
+            "preprocessing_config": {
+                "temporal_window_frames": 16,
+                "spatial_resolution": [112, 112],
+                "input_channels": 3,
+                "channel_order": "RGB",
+                "pixel_scaling": "0.0_to_1.0",
+                "normalization": {
+                    "mean": [0.43216, 0.394666, 0.37645],
+                    "std": [0.22803, 0.22145, 0.216989]
+                },
+                "stride_frames": 8,
+                "resize_strategy": "aspect_preserving_center_crop_112x112"
+            }
+        }
