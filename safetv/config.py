@@ -3,7 +3,7 @@ Configuration dataclasses for SafeTV Violence Detection Engine.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 @dataclass
@@ -21,11 +21,23 @@ class VideoExtractionConfig:
 @dataclass
 class ModelConfig:
     """Configuration for video action recognition backbone."""
-    architecture: str = "r2plus1d_18"  # Supported: "r2plus1d_18", "mc3_18", "videomae_small"
+    architecture: str = "r2plus1d_18"  # Supported: "r2plus1d_18", "mc3_18"
     num_classes: int = 2               # 0: Normal Activity, 1: Potential Violence
     pretrained: bool = True
+    checkpoint_path: Optional[str] = "models/violence_detector/best_model.pth"
     device: str = "cpu"                # Target device: "cpu", "cuda", or "directml"
     num_threads: int = 6               # CPU intra-op parallelism for Intel i5-12450H
+
+
+@dataclass
+class EvidenceConfig:
+    """Configuration for incident evidence clip slicing and archival."""
+    evidence_dir: str = "evidence"         # Output directory for video evidence clips
+    pre_buffer_sec: float = 2.0            # Pre-incident buffer duration in seconds
+    post_buffer_sec: float = 2.0           # Post-incident buffer duration in seconds
+    save_evidence_clips: bool = True       # Whether to automatically slice and save MP4 clips
+    save_incident_metadata: bool = True    # Whether to write JSON metadata per incident
+    video_codec: str = "mp4v"              # Codec for OpenCV VideoWriter ('mp4v' or 'avc1')
 
 
 @dataclass
@@ -40,8 +52,8 @@ class TemporalSmoothingConfig:
 @dataclass
 class IncidentClassifierConfig:
     """Configuration for dual-threshold hysteresis incident classification."""
-    onset_threshold: float = 0.65     # Threshold to trigger an incident (violence alert)
-    offset_threshold: float = 0.35    # Threshold to clear an active incident
+    onset_threshold: float = 0.60     # Threshold to trigger an incident (violence alert)
+    offset_threshold: float = 0.40    # Threshold to clear an active incident
     min_sustained_windows: int = 2    # Minimum consecutive windows above onset before firing an alert
     cool_off_windows: int = 2         # Minimum consecutive windows below offset before concluding incident
     severity_thresholds: dict = field(
@@ -55,8 +67,9 @@ class IncidentClassifierConfig:
 
 @dataclass
 class SafeTVConfig:
-    """Master configuration uniting video, model, smoothing, and incident classification."""
+    """Master configuration uniting video, model, smoothing, incident classification, and evidence."""
     extraction: VideoExtractionConfig = field(default_factory=VideoExtractionConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     smoothing: TemporalSmoothingConfig = field(default_factory=TemporalSmoothingConfig)
     incident: IncidentClassifierConfig = field(default_factory=IncidentClassifierConfig)
+    evidence: EvidenceConfig = field(default_factory=EvidenceConfig)

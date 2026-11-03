@@ -24,6 +24,8 @@ class Incident:
     severity: str
     sample_timestamps: List[float] = field(default_factory=list)
     sample_probabilities: List[float] = field(default_factory=list)
+    evidence_path: Optional[str] = None
+    metadata_path: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -36,6 +38,8 @@ class Incident:
             "peak_probability": round(self.peak_probability, 4),
             "mean_probability": round(self.mean_probability, 4),
             "severity": self.severity,
+            "evidence_path": self.evidence_path,
+            "metadata_path": self.metadata_path,
         }
 
 

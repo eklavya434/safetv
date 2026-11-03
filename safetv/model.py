@@ -1,7 +1,7 @@
 """
 Video Action Recognition Model Backbone for SafeTV.
 Provides spatiotemporal 3D convolution / factorized (2+1)D feature extraction
-and binary violence action classification.
+and binary violence action classification using genuinely trained weights.
 """
 
 import os
@@ -10,45 +10,21 @@ import numpy as np
 
 from .config import ModelConfig
 
-# Indices in Kinetics-400 corresponding to violent/aggressive combat actions
-KINETICS_VIOLENT_CLASSES = {
-    "punching person (boxing)": 261,
-    "kicking": 178,
-    "wrestling": 395,
-    "slapping": 307,
-    "headbutting": 154,
-    "side kick": 302,
-    "drop kick": 105,
-    "arm wrestling": 10,
-    "sword fighting": 339,
-    "judo": 175,
-}
-
-# Indices in Kinetics-400 corresponding to high-energy non-violent actions
-KINETICS_NORMAL_ACTIVE_CLASSES = {
-    "running": 279,
-    "jogging": 174,
-    "clapping": 69,
-    "hugging": 161,
-    "dancing": 90,
-    "jumping jacks": 176,
-    "exercising with exercise ball": 115,
-    "cheerleading": 64,
-    "high jump": 157,
-    "walking the dog": 387,
-}
-
 
 class VideoActionClassifier:
     """
     Spatiotemporal action recognition engine for SafeTV.
-    Distinguishes potential violence from normal high/low-energy human activities.
+    Distinguishes potential violence from normal high/low-energy human activities
+    using genuinely fine-tuned deep representations.
     """
 
     def __init__(self, config: Optional[ModelConfig] = None):
         self.config = config or ModelConfig()
         self.model = None
         self.device = None
+        self.is_trained: bool = False
+        self.provenance: str = "uninitialized"
+        self.loaded_checkpoint: Optional[str] = None
         self._init_model()
 
     def _init_model(self) -> None:
@@ -60,83 +36,76 @@ class VideoActionClassifier:
 
             # Tune intra-op thread count for Intel 12th Gen i5-12450H (4 P-cores + 4 E-cores)
             torch.set_num_threads(self.config.num_threads)
-            self.device = torch.device(self.config.device if torch.cuda.is_available() and self.config.device == "cuda" else "cpu")
+            self.device = torch.device(
+                self.config.device if torch.cuda.is_available() and self.config.device == "cuda" else "cpu"
+            )
 
             arch = self.config.architecture.lower()
 
-            if arch == "r2plus1d_18":
-                # Factorized Spatiotemporal (2+1)D ResNet-18
-                weights = video_models.R2Plus1D_18_Weights.DEFAULT if self.config.pretrained else None
-                base_model = video_models.r2plus1d_18(weights=weights)
-                in_features = base_model.fc.in_features
-
-                # Replace top layer with SafeTV Violence Classification Head:
-                # [0: Normal Activity, 1: Potential Violence]
-                base_model.fc = nn.Sequential(
-                    nn.Dropout(p=0.4),
-                    nn.Linear(in_features, 128),
-                    nn.ReLU(),
-                    nn.Linear(128, self.config.num_classes)
-                )
-                self.model = base_model
-
-            elif arch == "mc3_18":
-                # Mixed Convolution 3D ResNet-18
+            if arch == "mc3_18":
                 weights = video_models.MC3_18_Weights.DEFAULT if self.config.pretrained else None
                 base_model = video_models.mc3_18(weights=weights)
-                in_features = base_model.fc.in_features
-                base_model.fc = nn.Sequential(
-                    nn.Dropout(p=0.4),
-                    nn.Linear(in_features, 128),
-                    nn.ReLU(),
-                    nn.Linear(128, self.config.num_classes)
-                )
-                self.model = base_model
-
             else:
-                # Default to R2Plus1D-18
+                # Default to factorized R(2+1)D-18
                 weights = video_models.R2Plus1D_18_Weights.DEFAULT if self.config.pretrained else None
                 base_model = video_models.r2plus1d_18(weights=weights)
-                in_features = base_model.fc.in_features
-                base_model.fc = nn.Linear(in_features, self.config.num_classes)
-                self.model = base_model
 
+            in_features = base_model.fc.in_features
+
+            # SafeTV Violence Classification Head: [0: Normal Activity, 1: Potential Violence]
+            # Architecture matches SafeTVTrainer fine-tuning head exactly
+            base_model.fc = nn.Sequential(
+                nn.Dropout(p=0.5),
+                nn.Linear(in_features, 128),
+                nn.ReLU(),
+                nn.Dropout(p=0.3),
+                nn.Linear(128, self.config.num_classes)
+            )
+
+            self.model = base_model
             self._init_head_weights()
             self.model.to(self.device)
             self.model.eval()
 
+            # Attempt to automatically load trained checkpoint if specified and available
+            checkpoint = getattr(self.config, "checkpoint_path", None)
+            if checkpoint and os.path.exists(checkpoint):
+                self.load_checkpoint(checkpoint)
+            else:
+                self.is_trained = False
+                self.provenance = "uncalibrated_backbone"
+
         except ImportError:
             # Fallback when torch is not available
             self.model = None
+            self.is_trained = False
+            self.provenance = "heuristic_fallback"
 
     def _init_head_weights(self) -> None:
-        """
-        Calibrate head projections to provide well-conditioned probability separation.
-        Transfers learned Kinetics representations of violent vs benign actions.
-        """
-        import torch
+        """Initialize head linear layers with orthogonal weights."""
         import torch.nn as nn
-        # Initialize linear layers with calibrated weights
-        if hasattr(self.model, "fc"):
-            if isinstance(self.model.fc, nn.Sequential):
-                for module in self.model.fc:
-                    if isinstance(module, nn.Linear):
-                        nn.init.orthogonal_(module.weight, gain=0.5)
-                        if module.bias is not None:
-                            nn.init.constant_(module.bias, 0.0)
+        if hasattr(self.model, "fc") and isinstance(self.model.fc, nn.Sequential):
+            for module in self.model.fc:
+                if isinstance(module, nn.Linear):
+                    nn.init.orthogonal_(module.weight, gain=0.5)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0.0)
 
     def load_checkpoint(self, checkpoint_path: str) -> None:
-        """Load trained model weights from disk."""
+        """Load genuinely trained model weights from disk."""
         import torch
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found at: {checkpoint_path}")
         state = torch.load(checkpoint_path, map_location=self.device)
         self.model.load_state_dict(state)
         self.model.eval()
+        self.is_trained = True
+        self.provenance = "trained"
+        self.loaded_checkpoint = checkpoint_path
 
     def _extract_kinematic_flux(self, tensor_4d: np.ndarray) -> Tuple[float, float, float]:
         """
-        Extract physical spatiotemporal motion dynamics:
+        Extract physical spatiotemporal motion dynamics for diagnostic telemetry:
         1. Velocity energy: ||dI/dt||^2
         2. Jerk / impact acceleration: ||d^2I/dt^2||^2
         3. Chaos ratio: Jerk / (Velocity + eps)
@@ -149,11 +118,11 @@ class VideoActionClassifier:
         chaos_ratio = float(a_jerk / (v_energy + 1e-6))
         return v_energy, a_jerk, chaos_ratio
 
-    def predict_window(self, tensor_4d: np.ndarray) -> Dict[str, Union[float, str]]:
+    def predict_window(self, tensor_4d: np.ndarray) -> Dict[str, Union[float, str, bool, dict]]:
         """
         Run forward inference on a single spatiotemporal window (C, T, H, W).
-        Fuses deep 3D spatiotemporal representations with kinematic motion flux.
-        Returns calibrated violence probability and top predicted category.
+        Computes genuine AI violence probability without handcrafted heuristic blending.
+        Retains physical kinematic dynamics strictly as auxiliary telemetry.
         """
         if tensor_4d.ndim != 4:
             raise ValueError(f"Expected 4D array of shape (C, T, H, W), got shape {tensor_4d.shape}")
@@ -168,29 +137,25 @@ class VideoActionClassifier:
                 logits = self.model(tensor_5d)
                 probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
 
-            deep_viol_score = float(probs[1])
-
-            # Multi-stream fusion: Combine deep spatiotemporal feature confidence with
-            # physical impact acceleration / jerk energy.
-            # Violent brawls exhibit jerk > 1.0; calm walking < 0.25; rhythmic exercise ~0.55
-            # Logit formulation:
-            kinematic_logit = (a_jerk * 3.5) + (v_energy * 2.0) - 3.2
-            kinematic_prob = float(1.0 / (1.0 + np.exp(-kinematic_logit)))
-
-            # Ensemble fusion: 40% deep features + 60% kinematic motion dynamics
-            fused_prob = float(np.clip(0.40 * deep_viol_score + 0.60 * kinematic_prob, 0.0, 1.0))
-            normal_prob = 1.0 - fused_prob
-            label = "VIOLENCE" if fused_prob >= 0.50 else "NORMAL"
+            # Genuine AI classification probabilities: [0: Normal, 1: Violence]
+            normal_prob = float(probs[0])
+            violence_prob = float(probs[1])
+            label = "VIOLENCE" if violence_prob >= 0.50 else "NORMAL"
 
             return {
-                "violence_prob": fused_prob,
+                "violence_prob": violence_prob,
                 "normal_prob": normal_prob,
                 "predicted_label": label,
-                "deep_prob": deep_viol_score,
-                "kinematic_prob": kinematic_prob,
+                "is_trained": self.is_trained,
+                "provenance": self.provenance,
+                "motion_flux": {
+                    "velocity_energy": round(v_energy, 4),
+                    "jerk_acceleration": round(a_jerk, 4),
+                    "chaos_ratio": round(chaos_ratio, 4),
+                },
             }
         else:
-            # Fallback when torch is not available
+            # Fallback when PyTorch is not available: explicit heuristic diagnostics
             kinematic_logit = (a_jerk * 3.5) + (v_energy * 2.0) - 3.2
             violence_prob = float(np.clip(1.0 / (1.0 + np.exp(-kinematic_logit)), 0.0, 1.0))
             normal_prob = 1.0 - violence_prob
@@ -199,9 +164,16 @@ class VideoActionClassifier:
                 "violence_prob": violence_prob,
                 "normal_prob": normal_prob,
                 "predicted_label": label,
+                "is_trained": False,
+                "provenance": "heuristic_fallback",
+                "motion_flux": {
+                    "velocity_energy": round(v_energy, 4),
+                    "jerk_acceleration": round(a_jerk, 4),
+                    "chaos_ratio": round(chaos_ratio, 4),
+                },
             }
 
-    def predict_batch(self, tensors: List[np.ndarray]) -> List[Dict[str, Union[float, str]]]:
+    def predict_batch(self, tensors: List[np.ndarray]) -> List[Dict[str, Union[float, str, bool, dict]]]:
         """Run batch inference over a list of 4D spatiotemporal window arrays."""
         results = []
         for t in tensors:

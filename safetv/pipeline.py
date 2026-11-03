@@ -1,7 +1,7 @@
 """
 SafeTV Violence Detection Pipeline.
-Unifies spatiotemporal window extraction, model inference, temporal smoothing,
-and incident state classification into a cohesive end-to-end processing pipeline.
+Unifies spatiotemporal window extraction, genuine trained model inference,
+temporal prediction smoothing, incident state classification, and forensic evidence extraction.
 """
 
 import json
@@ -12,6 +12,7 @@ from typing import Dict, Generator, List, Optional, Union
 import numpy as np
 
 from .config import SafeTVConfig
+from .evidence import EvidenceExtractor
 from .incident_classifier import Incident, IncidentClassifier
 from .model import VideoActionClassifier
 from .temporal_smoothing import TemporalSmoother
@@ -59,6 +60,8 @@ class PipelineReport:
     peak_violence_prob: float
     fps: float
     execution_time_sec: float
+    is_model_trained: bool
+    model_provenance: str
     window_timeline: List[Dict]
 
     def to_dict(self) -> dict:
@@ -72,6 +75,8 @@ class PipelineReport:
             "peak_violence_prob": round(self.peak_violence_prob, 4),
             "fps": round(self.fps, 2),
             "execution_time_sec": round(self.execution_time_sec, 3),
+            "is_model_trained": self.is_model_trained,
+            "model_provenance": self.model_provenance,
             "window_timeline": self.window_timeline,
         }
 
@@ -84,7 +89,7 @@ class PipelineReport:
 class SafeTVPipeline:
     """
     Main processing engine orchestrating video windowing, model forward passes,
-    temporal prediction filtering, and incident alerting.
+    temporal prediction filtering, incident alerting, and evidence archival.
     """
 
     def __init__(self, config: Optional[SafeTVConfig] = None):
@@ -93,6 +98,7 @@ class SafeTVPipeline:
         self.model = VideoActionClassifier(self.config.model)
         self.smoother = TemporalSmoother(self.config.smoothing)
         self.incident_classifier = IncidentClassifier(self.config.incident)
+        self.evidence_extractor = EvidenceExtractor(self.config.evidence)
 
     def reset(self) -> None:
         """Reset temporal state and incident trackers."""
@@ -118,7 +124,7 @@ class SafeTVPipeline:
         last_end_time = 0.0
 
         for window in self.extractor.extract_from_frames(frames, fps=fps):
-            # 1. Model inference
+            # 1. Genuine AI model inference
             preds = self.model.predict_window(window.tensor)
             raw_prob = float(preds["violence_prob"])
 
@@ -156,8 +162,18 @@ class SafeTVPipeline:
 
         # Finalize open incidents
         final_incidents = self.incident_classifier.finalize()
-        exec_duration = time.time() - start_exec
 
+        # 4. Extract buffered evidence clips
+        if self.config.evidence.save_evidence_clips:
+            for inc in final_incidents:
+                self.evidence_extractor.extract_clip_from_frames(
+                    frames=frames,
+                    fps=fps,
+                    incident=inc,
+                    source_name=source_name,
+                )
+
+        exec_duration = time.time() - start_exec
         peak_val = max(smoothed_probs) if smoothed_probs else 0.0
         mean_val = float(np.mean(smoothed_probs)) if smoothed_probs else 0.0
 
@@ -171,6 +187,8 @@ class SafeTVPipeline:
             peak_violence_prob=peak_val,
             fps=fps,
             execution_time_sec=exec_duration,
+            is_model_trained=self.model.is_trained,
+            model_provenance=self.model.provenance,
             window_timeline=[w.to_dict() for w in timeline],
         )
 
@@ -180,7 +198,7 @@ class SafeTVPipeline:
         max_duration_sec: Optional[float] = None
     ) -> PipelineReport:
         """
-        Process a video file on disk.
+        Process a video file on disk, automatically slicing evidence clips for confirmed incidents.
         """
         self.reset()
         start_exec = time.time()
@@ -227,6 +245,15 @@ class SafeTVPipeline:
             window_idx += 1
 
         final_incidents = self.incident_classifier.finalize()
+
+        # Extract buffered evidence clips from file
+        if self.config.evidence.save_evidence_clips:
+            for inc in final_incidents:
+                self.evidence_extractor.extract_clip_from_file(
+                    video_path=video_path,
+                    incident=inc,
+                )
+
         exec_duration = time.time() - start_exec
 
         peak_val = max(smoothed_probs) if smoothed_probs else 0.0
@@ -242,5 +269,7 @@ class SafeTVPipeline:
             peak_violence_prob=peak_val,
             fps=fps_detected,
             execution_time_sec=exec_duration,
+            is_model_trained=self.model.is_trained,
+            model_provenance=self.model.provenance,
             window_timeline=[w.to_dict() for w in timeline],
         )

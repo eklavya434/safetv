@@ -42,6 +42,7 @@ ENV/
 incident_report.json
 benchmark_report.json
 *.log
+evidence/
 
 # Video Data
 data/raw/
