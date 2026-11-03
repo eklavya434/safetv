@@ -96,7 +96,12 @@ class VideoActionClassifier:
             # Attempt to automatically load trained checkpoint
             checkpoint = getattr(self.config, "checkpoint_path", None)
             if checkpoint and os.path.exists(checkpoint):
-                self.load_checkpoint(checkpoint)
+                try:
+                    self.load_checkpoint(checkpoint)
+                except ModelNotReadyError as e:
+                    self.is_trained = False
+                    self.is_ready = False
+                    logger.warning(f"Failed to load checkpoint '{checkpoint}': {e}")
             else:
                 self.is_trained = False
                 self.is_ready = False
@@ -139,32 +144,47 @@ class VideoActionClassifier:
         # Compute SHA-256 hash for integrity tracking
         self.checkpoint_hash = self._compute_file_hash(checkpoint_path)
 
-        # Validate against manifest if available
+        # Validate against manifest before loading; refuse on mismatch or missing manifest
+        import hmac
         ckpt_dir = os.path.dirname(checkpoint_path)
         manifest_path = os.path.join(ckpt_dir, "manifest.json")
-        if os.path.exists(manifest_path):
-            try:
-                with open(manifest_path, "r", encoding="utf-8") as mf:
-                    manifest = json.load(mf)
-                expected_hash = manifest.get("checkpoint_sha256", "").lower()
-                if expected_hash and self.checkpoint_hash.lower() != expected_hash:
-                    err_msg = (
-                        f"Checkpoint integrity failure: SHA-256 mismatch. "
-                        f"Expected {expected_hash[:12]}..., got {self.checkpoint_hash[:12]}... "
-                        "Checkpoint may be corrupted or tampered."
-                    )
-                    logger.error(err_msg)
-                    self.is_trained = False
-                    self.is_ready = False
-                    self.provenance = "integrity_failure"
-                    self.model_status_message = err_msg
-                    raise ModelNotReadyError(err_msg)
+        if not os.path.exists(manifest_path):
+            err_msg = f"Model manifest missing: {manifest_path}. Refusing to load unverified checkpoint."
+            logger.error(err_msg)
+            self.is_trained = False
+            self.is_ready = False
+            self.provenance = "missing_manifest"
+            self.model_status_message = err_msg
+            raise ModelNotReadyError(err_msg)
 
-                manifest_mapping = manifest.get("class_mapping", {})
-                if manifest_mapping:
-                    self.class_mapping = {int(k): v for k, v in manifest_mapping.items()}
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning(f"Could not read manifest.json: {e}")
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as mf:
+                manifest = json.load(mf)
+            expected_hash = manifest.get("checkpoint_sha256", "").lower()
+            if not expected_hash or not hmac.compare_digest(self.checkpoint_hash.lower(), expected_hash):
+                err_msg = (
+                    f"Checkpoint integrity failure: SHA-256 mismatch. "
+                    f"Expected {expected_hash[:12]}..., got {self.checkpoint_hash[:12]}... "
+                    "Checkpoint may be corrupted or tampered."
+                )
+                logger.error(err_msg)
+                self.is_trained = False
+                self.is_ready = False
+                self.provenance = "integrity_failure"
+                self.model_status_message = err_msg
+                raise ModelNotReadyError(err_msg)
+
+            manifest_mapping = manifest.get("class_mapping", {})
+            if manifest_mapping:
+                self.class_mapping = {int(k): v for k, v in manifest_mapping.items()}
+        except json.JSONDecodeError as e:
+            err_msg = f"Invalid manifest.json: {e}"
+            logger.error(err_msg)
+            self.is_trained = False
+            self.is_ready = False
+            self.provenance = "invalid_manifest"
+            self.model_status_message = err_msg
+            raise ModelNotReadyError(err_msg) from e
 
         # Attempt to load class mapping if present in checkpoint directory (overrides manifest if present)
         class_map_file = os.path.join(ckpt_dir, "class_mapping.json")
@@ -177,8 +197,8 @@ class VideoActionClassifier:
                 logger.warning(f"Could not parse class_mapping.json: {e}")
 
         try:
-            # Safe loading with torch
-            state = torch.load(checkpoint_path, map_location=self.device)
+            # Safe loading with torch (weights_only=True to prevent unpickling exploits)
+            state = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
             if not isinstance(state, dict):
                 raise ValueError("Checkpoint is not a valid state dictionary.")
 

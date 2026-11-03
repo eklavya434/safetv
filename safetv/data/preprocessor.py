@@ -22,6 +22,7 @@ except ImportError:
 
 from .config import DatasetConfig
 from .video_inspector import VideoInspector, VideoMetadata
+from safetv.preprocessing import standardize_frame_sequence
 
 
 @dataclass
@@ -105,32 +106,22 @@ class VideoPreprocessor:
             cap.set(cv2.CAP_PROP_POS_FRAMES, target_f)
             ret, bgr_frame = cap.read()
             if not ret or bgr_frame is None:
-                # Fallback: repeat last valid frame or blank canvas
-                if frames_rgb:
-                    frames_rgb.append(frames_rgb[-1].copy())
-                else:
-                    frames_rgb.append(np.zeros((self.config.target_height, self.config.target_width, 3), dtype=np.uint8))
-            else:
-                rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-                # Resize to target (W, H)
-                resized = cv2.resize(rgb, (self.config.target_width, self.config.target_height), interpolation=cv2.INTER_LINEAR)
-                frames_rgb.append(resized)
+                # Do not silently replace corrupted or unreadable frames with zero tensors
+                cap.release()
+                return None
+            rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+            frames_rgb.append(rgb)
 
         cap.release()
 
-        # Normalize and arrange into (C, T, H, W)
-        mean = np.array(self.config.normalize_mean, dtype=np.float32).reshape(3, 1, 1)
-        std = np.array(self.config.normalize_std, dtype=np.float32).reshape(3, 1, 1)
-
-        processed = []
-        for f in frames_rgb:
-            arr = np.transpose(f.astype(np.float32) / 255.0, (2, 0, 1)) # (C, H, W)
-            arr = (arr - mean) / std
-            processed.append(arr)
-
-        tensor = np.stack(processed, axis=0)        # (T, C, H, W)
-        tensor = np.transpose(tensor, (1, 0, 2, 3)) # (C, T, H, W)
-        return tensor.astype(np.float32)
+        # Normalize and arrange into (C, T, H, W) via unified preprocessor
+        return standardize_frame_sequence(
+            frames_rgb=frames_rgb,
+            target_hw=(self.config.target_height, self.config.target_width),
+            mean=tuple(self.config.normalize_mean),
+            std=tuple(self.config.normalize_std),
+            crop_mode="resize",
+        )
 
     def partition_videos(
         self,

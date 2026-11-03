@@ -16,6 +16,7 @@ except ImportError:
     cv2 = None
 
 from .config import VideoExtractionConfig
+from .preprocessing import standardize_frame_sequence
 
 
 @dataclass
@@ -42,37 +43,16 @@ class VideoWindowExtractor:
 
     def _resize_and_normalize(self, frames: List[np.ndarray]) -> np.ndarray:
         """
-        Resize RGB frames to (target_height, target_width) and normalize channels to (C, T, H, W).
+        Resize RGB frames to (target_height, target_width) and normalize channels to (C, T, H, W)
+        using the unified canonical preprocessor.
         """
-        processed_frames = []
-        mean = np.array(self.config.normalize_mean, dtype=np.float32).reshape(3, 1, 1)
-        std = np.array(self.config.normalize_std, dtype=np.float32).reshape(3, 1, 1)
-
-        for frame in frames:
-            # Resize using OpenCV when available for 10x SIMD speedup, fallback to PIL
-            if cv2 is not None:
-                h, w = frame.shape[:2]
-                if (w, h) != (self.config.target_width, self.config.target_height):
-                    resized = cv2.resize(frame, (self.config.target_width, self.config.target_height), interpolation=cv2.INTER_LINEAR)
-                else:
-                    resized = frame
-            else:
-                pil_img = Image.fromarray(frame)
-                if pil_img.size != (self.config.target_width, self.config.target_height):
-                    pil_img = pil_img.resize(
-                        (self.config.target_width, self.config.target_height),
-                        resample=Image.Resampling.BILINEAR
-                    )
-                resized = np.array(pil_img)
-            arr = np.array(resized, dtype=np.float32) / 255.0  # (H, W, C)
-            arr = np.transpose(arr, (2, 0, 1))                 # (C, H, W)
-            arr = (arr - mean) / std                           # Normalized
-            processed_frames.append(arr)
-
-        # Stack into (T, C, H, W) -> transpose to (C, T, H, W)
-        tensor = np.stack(processed_frames, axis=0)           # (T, C, H, W)
-        tensor = np.transpose(tensor, (1, 0, 2, 3))           # (C, T, H, W)
-        return tensor.astype(np.float32)
+        return standardize_frame_sequence(
+            frames_rgb=frames,
+            target_hw=(self.config.target_height, self.config.target_width),
+            mean=self.config.normalize_mean,
+            std=self.config.normalize_std,
+            crop_mode="resize",
+        )
 
     def extract_from_frames(
         self,
