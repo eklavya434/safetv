@@ -1,7 +1,8 @@
 """
 SafeTV Security Surveillance & Incident Response Server.
 Provides FastAPI REST API and Security Operations Center (SOC) Web Dashboard
-for video upload analysis, live webcam monitoring, incident review, and forensic evidence streaming.
+for video upload analysis, live webcam monitoring, RTSP CCTV multi-camera management,
+incident review, and automated alert dispatching.
 """
 
 import base64
@@ -21,6 +22,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from safetv import __version__
+from safetv.alerts import AlertConfig, AlertDispatcher
+from safetv.cctv import CameraConfig, CameraManager
 from safetv.config import SafeTVConfig
 from safetv.incident_classifier import Incident
 from safetv.pipeline import SafeTVPipeline
@@ -29,7 +32,7 @@ from safetv.pipeline import SafeTVPipeline
 app = FastAPI(
     title="SafeTV Surveillance & Incident Detection API",
     version=__version__,
-    description="Video-based AI violence recognition, forensic evidence generation, and operator review system.",
+    description="Spatiotemporal AI violence recognition, multi-camera management, and incident response platform.",
 )
 
 app.add_middleware(
@@ -40,9 +43,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize master pipeline
+# Core pipeline and management subsystems
 pipeline_config = SafeTVConfig()
 pipeline = SafeTVPipeline(pipeline_config)
+
+alert_dispatcher = AlertDispatcher(AlertConfig())
+camera_manager = CameraManager(
+    registry_file="cameras.json",
+    pipeline_config=pipeline_config,
+    alert_dispatcher=alert_dispatcher
+)
 
 UPLOAD_DIR = os.path.abspath("uploads")
 EVIDENCE_DIR = os.path.abspath("evidence")
@@ -52,7 +62,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(EVIDENCE_DIR, exist_ok=True)
 
 
-# Models
+# Request Models
 class ReviewPayload(BaseModel):
     status: str  # "CONFIRMED_VIOLENCE" or "FALSE_ALARM"
     reviewer_notes: Optional[str] = ""
@@ -60,8 +70,16 @@ class ReviewPayload(BaseModel):
 
 
 class WebcamWindowPayload(BaseModel):
-    frames_base64: List[str]  # List of JPEG base64 encoded frames (16 frames)
+    frames_base64: List[str]
     fps: Optional[float] = 15.0
+
+
+class CameraPayload(BaseModel):
+    camera_id: str
+    name: str
+    location: str
+    source_url: str
+    auto_start: Optional[bool] = False
 
 
 def load_all_incidents() -> List[Dict]:
@@ -91,6 +109,7 @@ def load_all_incidents() -> List[Dict]:
     return incidents
 
 
+# REST API Endpoints
 @app.get("/api/status")
 async def get_system_status():
     """Return AI engine status, model provenance, and hardware configuration."""
@@ -108,6 +127,10 @@ async def get_system_status():
             "onset_threshold": pipeline.config.incident.onset_threshold,
             "offset_threshold": pipeline.config.incident.offset_threshold,
         },
+        "cctv": {
+            "total_cameras": len(camera_manager.cameras),
+            "active_streams": sum(1 for w in camera_manager.workers.values() if w.status == "RUNNING"),
+        },
         "storage": {
             "evidence_dir": EVIDENCE_DIR,
             "total_incidents_logged": len(glob.glob(os.path.join(EVIDENCE_DIR, "*_metadata.json"))),
@@ -119,7 +142,7 @@ async def get_system_status():
 async def upload_and_analyze_video(file: UploadFile = File(...)):
     """
     Upload a surveillance video recording, execute genuine AI analysis,
-    generate incident records, and automatically extract forensic MP4 evidence clips.
+    generate incident records, extract forensic MP4 evidence clips, and trigger alerts.
     """
     valid_exts = [".mp4", ".avi", ".mov", ".mkv", ".webm"]
     ext = os.path.splitext(file.filename)[1].lower()
@@ -136,10 +159,28 @@ async def upload_and_analyze_video(file: UploadFile = File(...)):
         report = pipeline.process_file(temp_path)
         report_dict = report.to_dict()
 
-        # Augment incidents with evidence filenames for direct streaming
-        for inc in report_dict.get("incidents", []):
-            if inc.get("evidence_path"):
-                inc["evidence_filename"] = os.path.basename(inc["evidence_path"])
+        for inc_dict in report_dict.get("incidents", []):
+            if inc_dict.get("evidence_path"):
+                inc_dict["evidence_filename"] = os.path.basename(inc_dict["evidence_path"])
+
+            # Dispatch notification
+            temp_inc = Incident(
+                incident_id=inc_dict["incident_id"],
+                start_time_sec=inc_dict["start_time_sec"],
+                end_time_sec=inc_dict["end_time_sec"],
+                duration_sec=inc_dict["duration_sec"],
+                start_frame=inc_dict["start_frame"],
+                end_frame=inc_dict["end_frame"],
+                peak_probability=inc_dict["peak_probability"],
+                mean_probability=inc_dict["mean_probability"],
+                severity=inc_dict["severity"],
+                evidence_path=inc_dict.get("evidence_path"),
+            )
+            alert_dispatcher.dispatch_incident_alert(
+                incident=temp_inc,
+                camera_id="upload_feed",
+                camera_name=file.filename
+            )
 
         return {
             "success": True,
@@ -153,15 +194,13 @@ async def upload_and_analyze_video(file: UploadFile = File(...)):
 @app.post("/api/analyze/stream-window")
 async def analyze_stream_window(payload: WebcamWindowPayload):
     """
-    Process a rolling temporal window sent by the live laptop webcam or RTSP bridge.
-    Returns smoothed violence probability, incident trigger state, and motion telemetry.
+    Process rolling temporal window frames sent by the live laptop webcam.
     """
     if len(payload.frames_base64) < 8:
         raise HTTPException(status_code=400, detail="Insufficient frames for window inference (min 8 required).")
 
     decoded_frames = []
     for b64 in payload.frames_base64:
-        # Strip data URL prefix if present
         if "," in b64:
             b64 = b64.split(",", 1)[1]
         raw_bytes = base64.b64decode(b64)
@@ -192,12 +231,84 @@ async def analyze_stream_window(payload: WebcamWindowPayload):
     }
 
 
+# CCTV Multi-Camera Endpoints
+@app.get("/api/cameras")
+async def list_cameras():
+    """Retrieve all registered surveillance camera feeds and their live streaming telemetry."""
+    return {"cameras": camera_manager.get_all_camera_statuses()}
+
+
+@app.post("/api/cameras")
+async def register_camera(payload: CameraPayload):
+    """Register a new CCTV RTSP or file stream."""
+    cam = camera_manager.register_camera(
+        camera_id=payload.camera_id,
+        name=payload.name,
+        location=payload.location,
+        source_url=payload.source_url,
+        auto_start=payload.auto_start or False
+    )
+    return {"success": True, "camera": cam.to_dict()}
+
+
+@app.delete("/api/cameras/{camera_id}")
+async def delete_camera(camera_id: str):
+    """Remove a camera from the active registry."""
+    success = camera_manager.delete_camera(camera_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Camera not found.")
+    return {"success": True}
+
+
+@app.post("/api/cameras/{camera_id}/start")
+async def start_camera(camera_id: str):
+    """Start RTSP ingestion and AI surveillance worker for a camera."""
+    success = camera_manager.start_camera(camera_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Camera not found.")
+    return {"success": True}
+
+
+@app.post("/api/cameras/{camera_id}/stop")
+async def stop_camera(camera_id: str):
+    """Stop RTSP worker for a camera."""
+    success = camera_manager.stop_camera(camera_id)
+    return {"success": success}
+
+
+# Alert & Incident Endpoints
+@app.get("/api/alerts")
+async def list_alerts():
+    """Retrieve recent dispatched security alerts."""
+    return {"alerts": alert_dispatcher.get_recent_alerts()}
+
+
+@app.post("/api/alerts/test")
+async def trigger_test_alert():
+    """Trigger a sample security alert to test webhook / notification channels."""
+    test_incident = Incident(
+        incident_id=999,
+        start_time_sec=1.0,
+        end_time_sec=3.5,
+        duration_sec=2.5,
+        start_frame=30,
+        end_frame=105,
+        peak_probability=0.885,
+        mean_probability=0.812,
+        severity="CRITICAL",
+    )
+    alert = alert_dispatcher.dispatch_incident_alert(
+        incident=test_incident,
+        camera_id="test_cam",
+        camera_name="Test Verification Camera"
+    )
+    return {"success": True, "alert": alert.to_dict() if alert else None}
+
+
 @app.get("/api/incidents")
 async def list_incidents():
-    """List all detected incidents from the evidence repository."""
-    return {
-        "incidents": load_all_incidents()
-    }
+    """List all detected incidents from the forensic evidence repository."""
+    return {"incidents": load_all_incidents()}
 
 
 @app.get("/api/evidence/{filename}")
@@ -237,7 +348,7 @@ async def review_incident(incident_id: str, payload: ReviewPayload):
     }
 
 
-# Dashboard HTML UI
+# SOC Web Dashboard
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -275,8 +386,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Engine Status Pill -->
-    <div class="flex items-center space-x-4">
+    <!-- Navigation Bar -->
+    <div class="flex items-center space-x-3">
       <div id="modelPill" class="flex items-center space-x-2 text-xs px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700">
         <span class="h-2 w-2 rounded-full bg-emerald-500 animate-ping"></span>
         <span class="text-slate-300">Model: <strong id="modelArchText" class="text-white">R(2+1)D-18 (TRAINED)</strong></span>
@@ -287,25 +398,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <button onclick="switchTab('webcamTab')" id="tabBtnWebcam" class="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-800 text-slate-300 hover:text-white">
         Live Webcam
       </button>
+      <button onclick="switchTab('cctvTab')" id="tabBtnCctv" class="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-800 text-slate-300 hover:text-white">
+        CCTV Streams
+      </button>
       <button onclick="switchTab('incidentsTab')" id="tabBtnIncidents" class="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-800 text-slate-300 hover:text-white flex items-center gap-1.5">
         <span>Incident Vault</span>
         <span id="incidentBadge" class="bg-red-500/20 text-red-400 text-xs px-1.5 py-0.2 rounded font-bold">0</span>
       </button>
+      <button onclick="switchTab('alertsTab')" id="tabBtnAlerts" class="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-800 text-slate-300 hover:text-white">
+        Alerts Log
+      </button>
     </div>
   </header>
 
-  <!-- Live Alert Banner (hidden by default) -->
+  <!-- Live Alert Banner -->
   <div id="liveAlertBanner" class="hidden alert-pulse border-b border-red-500/50 bg-red-950/60 px-6 py-2.5 text-center text-red-200 font-semibold text-sm flex items-center justify-center gap-2">
     <svg class="h-5 w-5 text-red-400 animate-bounce" fill="none" viewBox="0 0 24 24" stroke="currentColor">
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
     </svg>
-    <span>CRITICAL SAFETY ALERT: Potential physical altercation detected in active feed!</span>
+    <span>CRITICAL SAFETY ALERT: Potential physical altercation detected in active surveillance feed!</span>
   </div>
 
   <!-- Main Content Area -->
   <main class="flex-1 p-6 max-w-7xl w-full mx-auto">
     
-    <!-- TAB 1: VIDEO UPLOAD & DETAILED ANALYSIS -->
+    <!-- TAB 1: VIDEO UPLOAD -->
     <div id="uploadTab" class="space-y-6">
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
         
@@ -356,7 +473,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
 
           <div id="resultsContent" class="hidden space-y-5">
-            <!-- Metric Cards Row -->
             <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
               <div class="bg-slate-950 p-3 rounded-lg border border-slate-800">
                 <span class="text-xs text-slate-400 block">Peak Probability</span>
@@ -376,11 +492,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               </div>
             </div>
 
-            <!-- Probability Bar Graph -->
             <div>
               <span class="text-xs font-semibold text-slate-300 block mb-2">Temporal Violence Probability Timeline:</span>
-              <div id="timelineBars" class="h-20 bg-slate-950 rounded-lg border border-slate-800 p-2 flex items-end gap-1 overflow-x-auto">
-              </div>
+              <div id="timelineBars" class="h-20 bg-slate-950 rounded-lg border border-slate-800 p-2 flex items-end gap-1 overflow-x-auto"></div>
               <div class="flex justify-between text-[10px] text-slate-500 mt-1">
                 <span>0.0s</span>
                 <span class="text-red-400">--- Incident Onset Threshold (0.60) ---</span>
@@ -388,7 +502,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               </div>
             </div>
 
-            <!-- Detected Incidents Container -->
             <div id="detectedIncidentsBox" class="space-y-3">
               <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400">Detected Incident Evidence Records:</h3>
               <div id="incidentsList" class="space-y-3"></div>
@@ -402,19 +515,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <!-- TAB 2: LIVE WEBCAM MONITORING -->
     <div id="webcamTab" class="hidden space-y-6">
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        
-        <!-- Live Camera Viewfinder -->
         <div class="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-6">
           <div class="flex items-center justify-between mb-4">
             <div>
               <h2 class="text-base font-semibold text-white">Live Camera Safety Feed</h2>
               <p class="text-xs text-slate-400">Processes rolling spatiotemporal windows in real-time from webcam.</p>
             </div>
-            <div class="flex items-center gap-2">
-              <button onclick="toggleWebcam()" id="webcamToggleBtn" class="px-4 py-1.5 rounded-lg text-sm font-semibold bg-emerald-600 hover:bg-emerald-500 text-white transition shadow">
-                Start Camera
-              </button>
-            </div>
+            <button onclick="toggleWebcam()" id="webcamToggleBtn" class="px-4 py-1.5 rounded-lg text-sm font-semibold bg-emerald-600 hover:bg-emerald-500 text-white transition shadow">
+              Start Camera
+            </button>
           </div>
 
           <div class="relative bg-black rounded-lg overflow-hidden aspect-video flex items-center justify-center border border-slate-800">
@@ -426,7 +535,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               Camera is currently inactive. Click <strong>Start Camera</strong> to begin live monitoring.
             </div>
 
-            <!-- HUD Overlay -->
             <div id="webcamHUD" class="hidden absolute top-3 left-3 right-3 flex justify-between items-center pointer-events-none">
               <span id="liveStatusBadge" class="bg-emerald-500/90 text-black text-xs font-bold px-2.5 py-1 rounded shadow">
                 FEED NORMAL
@@ -438,7 +546,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- Live Metrics Sidebar -->
         <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-5">
           <h2 class="text-base font-semibold text-white">Live Threat Telemetry</h2>
 
@@ -455,14 +562,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="p-4 rounded-lg bg-slate-950 border border-slate-800 space-y-2 text-xs">
             <div class="flex justify-between">
               <span class="text-slate-400">Inference Engine:</span>
-              <span class="text-slate-200 font-mono">R(2+1)D-18</span>
+              <span class="text-slate-200 font-mono">R(2+1)D-18 (Fine-Tuned)</span>
             </div>
             <div class="flex justify-between">
-              <span class="text-slate-400">Window Stride:</span>
+              <span class="text-slate-400">Window Size:</span>
               <span class="text-slate-200 font-mono">16 frames (stride 2)</span>
             </div>
             <div class="flex justify-between">
-              <span class="text-slate-400">Alert Threshold:</span>
+              <span class="text-slate-400">Alert Onset:</span>
               <span class="text-slate-200 font-mono">&ge; 0.60</span>
             </div>
           </div>
@@ -474,17 +581,35 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
           </div>
         </div>
-
       </div>
     </div>
 
-    <!-- TAB 3: INCIDENT VAULT & AUDIT -->
+    <!-- TAB 3: CCTV MULTI-CAMERA STREAMS -->
+    <div id="cctvTab" class="hidden space-y-6">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-6">
+        <div class="flex items-center justify-between mb-6">
+          <div>
+            <h2 class="text-base font-semibold text-white">RTSP CCTV Camera Network</h2>
+            <p class="text-xs text-slate-400">Manage multi-camera RTSP surveillance streams with automated reconnection.</p>
+          </div>
+          <button onclick="openAddCameraModal()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-600 hover:bg-red-500 text-white transition shadow flex items-center gap-1">
+            + Register Camera
+          </button>
+        </div>
+
+        <div id="cctvGrid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <!-- Dynamically populated camera cards -->
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 4: INCIDENT VAULT & AUDIT -->
     <div id="incidentsTab" class="hidden space-y-6">
       <div class="bg-slate-900 border border-slate-800 rounded-xl p-6">
         <div class="flex items-center justify-between mb-4">
           <div>
             <h2 class="text-base font-semibold text-white">Incident Evidence Vault</h2>
-            <p class="text-xs text-slate-400">Comprehensive forensic archive of all detected safety altercations.</p>
+            <p class="text-xs text-slate-400">Forensic archive of all detected safety altercations.</p>
           </div>
           <button onclick="refreshIncidents()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition">
             Refresh Vault
@@ -510,6 +635,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               </tr>
             </tbody>
           </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 5: ALERTS LOG -->
+    <div id="alertsTab" class="hidden space-y-6">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-6">
+        <div class="flex items-center justify-between mb-4">
+          <div>
+            <h2 class="text-base font-semibold text-white">Real-Time Alerts Dispatch Stream</h2>
+            <p class="text-xs text-slate-400">Security notifications dispatched to personnel, webhooks, and audit logs.</p>
+          </div>
+          <div class="flex gap-2">
+            <button onclick="triggerTestAlert()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition">
+              Dispatch Test Alert
+            </button>
+            <button onclick="refreshAlerts()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition">
+              Refresh Alerts
+            </button>
+          </div>
+        </div>
+
+        <div id="alertsList" class="space-y-3">
+          <!-- Populated dynamically -->
         </div>
       </div>
     </div>
@@ -551,6 +700,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Register Camera Modal -->
+  <div id="addCameraModal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+      <div class="flex justify-between items-center border-b border-slate-800 pb-3">
+        <h3 class="text-base font-bold text-white">Register Surveillance Camera</h3>
+        <button onclick="closeAddCameraModal()" class="text-slate-400 hover:text-white text-lg font-bold">&times;</button>
+      </div>
+
+      <div class="space-y-3 text-xs">
+        <div>
+          <label class="text-slate-400 block mb-1">Camera ID:</label>
+          <input type="text" id="camIdInput" class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-white" placeholder="e.g. cam_front_gate" />
+        </div>
+        <div>
+          <label class="text-slate-400 block mb-1">Name:</label>
+          <input type="text" id="camNameInput" class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-white" placeholder="e.g. Main Entrance Gate" />
+        </div>
+        <div>
+          <label class="text-slate-400 block mb-1">Location:</label>
+          <input type="text" id="camLocationInput" class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-white" placeholder="e.g. Building A - Exterior" />
+        </div>
+        <div>
+          <label class="text-slate-400 block mb-1">Stream URL (RTSP / Local File):</label>
+          <input type="text" id="camUrlInput" class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-white font-mono" placeholder="rtsp://192.168.1.50:554/live or data/raw/violence/punching_001.mp4" />
+        </div>
+      </div>
+
+      <div class="flex justify-end gap-3 pt-2">
+        <button onclick="closeAddCameraModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition">Cancel</button>
+        <button onclick="submitNewCamera()" class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-xs font-semibold transition shadow">Save Camera</button>
+      </div>
+    </div>
+  </div>
+
   <footer class="border-t border-slate-800/80 bg-slate-950/60 px-6 py-3 text-center text-xs text-slate-500">
     SafeTV &mdash; AI Surveillance Safety &amp; Violence Detection Platform &bull; Intel CPU Optimized
   </footer>
@@ -562,26 +745,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     let isWebcamRunning = false;
     let capturedFramesBuffer = [];
 
-    // Navigation Tabs
     function switchTab(tabId) {
-      ['uploadTab', 'webcamTab', 'incidentsTab'].forEach(t => {
+      ['uploadTab', 'webcamTab', 'cctvTab', 'incidentsTab', 'alertsTab'].forEach(t => {
         document.getElementById(t).classList.add('hidden');
       });
       document.getElementById(tabId).classList.remove('hidden');
 
-      ['tabBtnUpload', 'tabBtnWebcam', 'tabBtnIncidents'].forEach(b => {
+      ['tabBtnUpload', 'tabBtnWebcam', 'tabBtnCctv', 'tabBtnIncidents', 'tabBtnAlerts'].forEach(b => {
         const btn = document.getElementById(b);
         btn.classList.remove('bg-red-600', 'text-white');
         btn.classList.add('bg-slate-800', 'text-slate-300');
       });
 
-      if (tabId === 'uploadTab') {
-        document.getElementById('tabBtnUpload').classList.add('bg-red-600', 'text-white');
-      } else if (tabId === 'webcamTab') {
-        document.getElementById('tabBtnWebcam').classList.add('bg-red-600', 'text-white');
-      } else if (tabId === 'incidentsTab') {
+      if (tabId === 'uploadTab') document.getElementById('tabBtnUpload').classList.add('bg-red-600', 'text-white');
+      if (tabId === 'webcamTab') document.getElementById('tabBtnWebcam').classList.add('bg-red-600', 'text-white');
+      if (tabId === 'cctvTab') {
+        document.getElementById('tabBtnCctv').classList.add('bg-red-600', 'text-white');
+        refreshCameras();
+      }
+      if (tabId === 'incidentsTab') {
         document.getElementById('tabBtnIncidents').classList.add('bg-red-600', 'text-white');
         refreshIncidents();
+      }
+      if (tabId === 'alertsTab') {
+        document.getElementById('tabBtnAlerts').classList.add('bg-red-600', 'text-white');
+        refreshAlerts();
       }
     }
 
@@ -661,7 +849,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('resWindows').textContent = `${report.total_duration_sec.toFixed(1)}s (${report.total_windows_processed}w)`;
       document.getElementById('resExecSpeed').textContent = `${report.execution_time_sec.toFixed(2)}s`;
 
-      // Timeline bars
       const barsContainer = document.getElementById('timelineBars');
       barsContainer.innerHTML = '';
       (report.window_timeline || []).forEach(w => {
@@ -682,7 +869,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       });
       document.getElementById('timelineEndLabel').textContent = `${report.total_duration_sec.toFixed(1)}s`;
 
-      // Incidents list
       const incList = document.getElementById('incidentsList');
       incList.innerHTML = '';
 
@@ -773,7 +959,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         isWebcamRunning = true;
         capturedFramesBuffer = [];
 
-        // Offscreen canvas for frame capture
         const canvas = document.createElement('canvas');
         canvas.width = 160;
         canvas.height = 120;
@@ -785,10 +970,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const b64 = canvas.toDataURL('image/jpeg', 0.6);
           capturedFramesBuffer.push(b64);
 
-          // Once 16 frames are accumulated, send window
           if (capturedFramesBuffer.length >= 16) {
             const windowToSend = capturedFramesBuffer.slice(-16);
-            capturedFramesBuffer = capturedFramesBuffer.slice(-8); // Keep 8 overlapping frames
+            capturedFramesBuffer = capturedFramesBuffer.slice(-8);
 
             try {
               const resp = await fetch('/api/analyze/stream-window', {
@@ -804,7 +988,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               console.error('Webcam window inference error:', e);
             }
           }
-        }, 120); // ~8 FPS sampling
+        }, 120);
 
       } catch (err) {
         alert('Could not access webcam: ' + err.message);
@@ -864,6 +1048,154 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+    // CCTV Multi-Camera Management
+    function openAddCameraModal() {
+      document.getElementById('addCameraModal').classList.remove('hidden');
+    }
+    function closeAddCameraModal() {
+      document.getElementById('addCameraModal').classList.add('hidden');
+    }
+
+    async function submitNewCamera() {
+      const camera_id = document.getElementById('camIdInput').value.trim();
+      const name = document.getElementById('camNameInput').value.trim();
+      const location = document.getElementById('camLocationInput').value.trim();
+      const source_url = document.getElementById('camUrlInput').value.trim();
+
+      if (!camera_id || !name || !source_url) {
+        alert('Please provide Camera ID, Name, and Stream URL');
+        return;
+      }
+
+      try {
+        await fetch('/api/cameras', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ camera_id, name, location, source_url, auto_start: false })
+        });
+        closeAddCameraModal();
+        refreshCameras();
+      } catch (err) {
+        alert('Failed to register camera: ' + err.message);
+      }
+    }
+
+    async function refreshCameras() {
+      try {
+        const resp = await fetch('/api/cameras');
+        const data = await resp.json();
+        const grid = document.getElementById('cctvGrid');
+        grid.innerHTML = '';
+
+        const cameras = data.cameras || [];
+        if (cameras.length === 0) {
+          grid.innerHTML = '<div class="col-span-full py-12 text-center text-slate-500 text-xs italic">No CCTV streams registered. Click "+ Register Camera" to add an RTSP stream or test video.</div>';
+          return;
+        }
+
+        cameras.forEach(cam => {
+          const isRunning = cam.status === 'RUNNING';
+          const card = document.createElement('div');
+          card.className = 'p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3';
+          card.innerHTML = `
+            <div class="flex items-center justify-between">
+              <div>
+                <h4 class="font-bold text-white text-sm">${cam.name}</h4>
+                <p class="text-[11px] text-slate-400">${cam.location} &bull; <span class="font-mono text-slate-500">${cam.camera_id}</span></p>
+              </div>
+              <span class="px-2 py-0.5 rounded text-[10px] font-bold ${isRunning ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-slate-800 text-slate-400'}">
+                ${cam.status}
+              </span>
+            </div>
+            <div class="p-2.5 rounded bg-slate-900 border border-slate-800 text-[11px] space-y-1 font-mono">
+              <div class="flex justify-between"><span>Stream:</span><span class="truncate max-w-[180px] text-slate-400" title="${cam.source_url}">${cam.source_url}</span></div>
+              <div class="flex justify-between"><span>FPS / Incidents:</span><span>${cam.fps} FPS / <strong class="text-red-400">${cam.incidents_detected}</strong></span></div>
+              <div class="flex justify-between"><span>Threat Prob:</span><span class="${cam.current_violence_prob >= 0.60 ? 'text-red-400 font-bold' : 'text-slate-200'}">${(cam.current_violence_prob * 100).toFixed(1)}% (Peak: ${(cam.peak_violence_prob * 100).toFixed(1)}%)</span></div>
+            </div>
+            <div class="flex justify-between items-center pt-1">
+              <button onclick="toggleCamera('${cam.camera_id}', ${isRunning})" class="px-3 py-1 rounded text-xs font-semibold ${isRunning ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-emerald-600 hover:bg-emerald-500 text-white'} transition">
+                ${isRunning ? 'Stop Stream' : 'Start Stream'}
+              </button>
+              <button onclick="deleteCamera('${cam.camera_id}')" class="text-xs text-red-400 hover:text-red-300">
+                Remove
+              </button>
+            </div>
+          `;
+          grid.appendChild(card);
+        });
+      } catch (err) {
+        console.error('Failed to load cameras:', err);
+      }
+    }
+
+    async function toggleCamera(id, isRunning) {
+      const endpoint = isRunning ? `/api/cameras/${id}/stop` : `/api/cameras/${id}/start`;
+      try {
+        await fetch(endpoint, { method: 'POST' });
+        refreshCameras();
+      } catch (e) {
+        alert('Action failed: ' + e.message);
+      }
+    }
+
+    async function deleteCamera(id) {
+      if (!confirm(`Remove camera ${id}?`)) return;
+      try {
+        await fetch(`/api/cameras/${id}`, { method: 'DELETE' });
+        refreshCameras();
+      } catch (e) {
+        alert('Delete failed: ' + e.message);
+      }
+    }
+
+    // Alerts Log
+    async function refreshAlerts() {
+      try {
+        const resp = await fetch('/api/alerts');
+        const data = await resp.json();
+        const list = document.getElementById('alertsList');
+        list.innerHTML = '';
+
+        const alerts = data.alerts || [];
+        if (alerts.length === 0) {
+          list.innerHTML = '<p class="text-xs text-slate-500 italic py-8 text-center">No security alerts dispatched yet.</p>';
+          return;
+        }
+
+        alerts.forEach(a => {
+          const item = document.createElement('div');
+          item.className = 'p-3 rounded-lg bg-slate-950 border border-red-500/30 flex items-center justify-between text-xs';
+          item.innerHTML = `
+            <div>
+              <div class="flex items-center gap-2 mb-1">
+                <span class="px-2 py-0.5 rounded font-bold bg-red-600 text-white text-[10px]">${a.severity}</span>
+                <span class="font-bold text-white">${a.alert_id}</span>
+                <span class="text-slate-400 font-mono">${a.timestamp}</span>
+              </div>
+              <p class="text-slate-300">${a.message}</p>
+            </div>
+            ${a.evidence_clip_url ? `
+              <a href="${a.evidence_clip_url}" target="_blank" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded text-xs">
+                View Clip
+              </a>
+            ` : ''}
+          `;
+          list.appendChild(item);
+        });
+      } catch (err) {
+        console.error('Failed to load alerts:', err);
+      }
+    }
+
+    async function triggerTestAlert() {
+      try {
+        await fetch('/api/alerts/test', { method: 'POST' });
+        refreshAlerts();
+      } catch (e) {
+        alert('Failed to trigger test alert: ' + e.message);
+      }
+    }
+
     // Incident Vault
     async function refreshIncidents() {
       try {
@@ -912,7 +1244,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    // Init
     document.addEventListener('DOMContentLoaded', () => {
       refreshIncidents();
     });
@@ -934,6 +1265,7 @@ def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
     print("=" * 65)
     print(f" SafeTV Surveillance Web Server starting on http://{host}:{port}")
     print(f" AI Model: {pipeline.config.model.architecture} (Trained: {pipeline.model.is_trained})")
+    print(f" Multi-Camera Engine & Alert Dispatcher: ACTIVE")
     print("=" * 65)
     uvicorn.run(app, host=host, port=port)
 

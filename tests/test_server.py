@@ -108,6 +108,41 @@ class TestSafeTVServer(unittest.TestCase):
         self.assertIn("smoothed_violence_prob", data)
         self.assertTrue(data["is_model_trained"])
 
+    def test_camera_crud_and_alerts_endpoints(self):
+        """Validates camera registration, status polling, and alert dispatching."""
+        # Register new camera
+        cam_payload = {
+            "camera_id": "api_test_cam",
+            "name": "API Test Camera",
+            "location": "North Corridor",
+            "source_url": "data/raw/violence/punching_001.mp4",
+            "auto_start": False,
+        }
+        reg_resp = self.client.post("/api/cameras", json=cam_payload)
+        self.assertEqual(reg_resp.status_code, 200)
+        self.assertTrue(reg_resp.json()["success"])
+
+        # List cameras
+        list_resp = self.client.get("/api/cameras")
+        self.assertEqual(list_resp.status_code, 200)
+        cams = list_resp.json()["cameras"]
+        self.assertTrue(any(c["camera_id"] == "api_test_cam" for c in cams))
+
+        # Test alert trigger
+        alert_resp = self.client.post("/api/alerts/test")
+        self.assertEqual(alert_resp.status_code, 200)
+        self.assertTrue(alert_resp.json()["success"])
+
+        # Check alert list
+        alerts_list_resp = self.client.get("/api/alerts")
+        self.assertEqual(alerts_list_resp.status_code, 200)
+        alerts = alerts_list_resp.json()["alerts"]
+        self.assertGreaterEqual(len(alerts), 1)
+
+        # Cleanup camera
+        del_resp = self.client.delete("/api/cameras/api_test_cam")
+        self.assertEqual(del_resp.status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()
