@@ -548,74 +548,138 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SafeTV - AI Video Surveillance & Incident Response</title>
+  <meta name="description" content="SafeTV Security Operations Center: Real-time neural video surveillance and physical violence incident triage dashboard.">
+  <title>SafeTV: AI Video Surveillance and Incident Response</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    @keyframes pulse-red {
-      0%, 100% { background-color: rgba(239, 68, 68, 0.2); }
-      50% { background-color: rgba(239, 68, 68, 0.5); }
+    /* Hallmark · theme: precision-dark · genre: modern-minimal · scope: app */
+    /* Hallmark · pre-emit critique: P5 H4 E5 S5 R5 V4 · weakest: H, dense telemetry console balanced with clear status hierarchy */
+    :root {
+      --bg-base: #020617;
+      --bg-surface: #0a0f1d;
+      --bg-elevated: #151d2f;
+      --bg-subtle: #243048;
+      --border-main: #182235;
+      --border-accent: #2e3e5b;
+      --text-main: #f1f5f9;
+      --text-muted: #8b9bb4;
+      --text-subtle: #5f718d;
+      --accent-danger: #e11d48;
+      --accent-danger-bg: rgba(225, 29, 72, 0.15);
+      --accent-danger-pulse: rgba(225, 29, 72, 0.35);
+      --accent-success: #059669;
+      --accent-warning: #d97706;
+      --font-body: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
-    .alert-pulse { animation: pulse-red 1.5s infinite; }
-    .custom-scrollbar::-webkit-scrollbar { width: 6px; }
-    .custom-scrollbar::-webkit-scrollbar-track { background: #1f2937; }
-    .custom-scrollbar::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+
+    html, body {
+      overflow-x: clip;
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      font-family: var(--font-body);
+    }
+
+    @keyframes pulse-red {
+      0%, 100% { background-color: var(--accent-danger-bg); }
+      50% { background-color: var(--accent-danger-pulse); }
+    }
+
+    .alert-pulse {
+      animation: pulse-red 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+
+    .custom-scrollbar::-webkit-scrollbar {
+      width: 6px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-track {
+      background: var(--bg-base);
+    }
+    .custom-scrollbar::-webkit-scrollbar-thumb {
+      background: var(--bg-subtle);
+      border-radius: 3px;
+    }
+
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+      outline: 2px solid var(--accent-danger);
+      outline-offset: 1px;
+    }
+
+    button:active {
+      transform: scale(0.98);
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
   </style>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col font-sans">
+<body class="min-h-screen flex flex-col font-sans">
   
   <!-- Top Navigation Header -->
-  <header class="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-50 px-6 py-3 flex items-center justify-between">
+  <header class="border-b border-slate-800 bg-slate-900 sticky top-0 z-50 px-6 py-3 flex items-center justify-between">
     <div class="flex items-center space-x-3">
-      <div class="h-9 w-9 rounded-lg bg-red-600 flex items-center justify-center font-black text-xl tracking-wider shadow-lg shadow-red-500/20">
+      <div class="h-9 w-9 rounded-lg bg-red-600 flex items-center justify-center font-bold text-xl text-white">
         S
       </div>
       <div>
-        <h1 class="text-lg font-bold tracking-tight text-white flex items-center gap-2">
+        <h1 class="text-lg font-bold text-white flex items-center gap-2">
           SafeTV
           <span id="prodBadge" class="text-xs font-semibold px-2 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
             RESEARCH MODE
           </span>
         </h1>
-        <p class="text-xs text-slate-400">Video Action Recognition & Incident Alert System</p>
+        <p class="text-xs text-slate-400">Video Action Recognition and Incident Alert System</p>
       </div>
     </div>
 
     <!-- Navigation Bar -->
-    <div class="flex items-center space-x-3">
+    <div class="flex items-center space-x-2">
       <div id="modelPill" class="flex items-center space-x-2 text-xs px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700">
-        <span id="modelDot" class="h-2 w-2 rounded-full bg-emerald-500 animate-ping"></span>
-        <span class="text-slate-300">Model: <strong id="modelArchText" class="text-white">R(2+1)D-18 (TRAINED)</strong></span>
+        <span id="modelDot" class="h-2 w-2 rounded-full bg-emerald-500"></span>
+        <span class="text-slate-300">Model: <strong id="modelArchText" class="text-white font-semibold">R(2+1)D-18 (TRAINED)</strong></span>
       </div>
-      <button onclick="switchTab('uploadTab')" id="tabBtnUpload" class="px-3 py-1.5 rounded-lg text-sm font-medium bg-red-600 text-white shadow">
+      <button onclick="switchTab('uploadTab')" id="tabBtnUpload" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-600 text-white transition-colors duration-150">
         Video Analysis
       </button>
-      <button onclick="switchTab('webcamTab')" id="tabBtnWebcam" class="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-800 text-slate-300 hover:text-white">
+      <button onclick="switchTab('webcamTab')" id="tabBtnWebcam" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-300 hover:text-white transition-colors duration-150">
         Live Webcam
       </button>
-      <button onclick="switchTab('cctvTab')" id="tabBtnCctv" class="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-800 text-slate-300 hover:text-white">
+      <button onclick="switchTab('cctvTab')" id="tabBtnCctv" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-300 hover:text-white transition-colors duration-150">
         CCTV Streams
       </button>
-      <button onclick="switchTab('incidentsTab')" id="tabBtnIncidents" class="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-800 text-slate-300 hover:text-white flex items-center gap-1.5">
+      <button onclick="switchTab('incidentsTab')" id="tabBtnIncidents" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-300 hover:text-white transition-colors duration-150 flex items-center gap-1.5">
         <span>Incident Vault</span>
         <span id="incidentBadge" class="bg-red-500/20 text-red-400 text-xs px-1.5 py-0.2 rounded font-bold">0</span>
       </button>
-      <button onclick="switchTab('alertsTab')" id="tabBtnAlerts" class="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-800 text-slate-300 hover:text-white">
+      <button onclick="switchTab('alertsTab')" id="tabBtnAlerts" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-300 hover:text-white transition-colors duration-150">
         Alerts Log
       </button>
     </div>
   </header>
 
   <!-- Model Not Ready Banner -->
-  <div id="modelNotReadyBanner" class="hidden border-b border-amber-500/50 bg-amber-950/70 px-6 py-2 text-center text-amber-200 font-semibold text-xs flex items-center justify-center gap-2">
-    <span>⚠️ WARNING: Model is in MODEL_NOT_READY state. Valid trained checkpoint not loaded. Automated incident alerting is disabled.</span>
+  <div id="modelNotReadyBanner" class="hidden border-b border-amber-500/50 bg-amber-950 px-6 py-2 text-center text-amber-200 font-semibold text-xs flex items-center justify-center gap-2">
+    <svg class="h-4 w-4 text-amber-400" aria-hidden="true" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+    </svg>
+    <span>Warning: Model is in MODEL_NOT_READY state. Valid trained checkpoint not loaded. Automated incident alerting is disabled.</span>
   </div>
 
   <!-- Live Alert Banner -->
-  <div id="liveAlertBanner" class="hidden alert-pulse border-b border-red-500/50 bg-red-950/60 px-6 py-2.5 text-center text-red-200 font-semibold text-sm flex items-center justify-center gap-2">
-    <svg class="h-5 w-5 text-red-400 animate-bounce" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+  <div id="liveAlertBanner" class="hidden alert-pulse border-b border-red-500/50 bg-red-950 px-6 py-2.5 text-center text-red-200 font-semibold text-xs flex items-center justify-center gap-2">
+    <svg class="h-4 w-4 text-red-400" aria-hidden="true" fill="none" viewBox="0 0 24 24" stroke="currentColor">
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
     </svg>
-    <span>Potential physical violence detected — human verification required.</span>
+    <span>Potential physical violence detected: human verification required.</span>
   </div>
 
   <!-- Main Content Area -->
@@ -631,8 +695,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <h2 class="text-base font-semibold text-white mb-1">Analyze Surveillance Recording</h2>
             <p class="text-xs text-slate-400 mb-4">Upload an MP4, AVI, or MOV CCTV file to run through the trained violence detector.</p>
             
-            <div id="dropZone" class="border-2 border-dashed border-slate-700 hover:border-red-500 rounded-xl p-8 text-center cursor-pointer transition bg-slate-950/40">
-              <svg class="h-10 w-10 mx-auto text-slate-500 mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <div id="dropZone" class="border-2 border-dashed border-slate-700 hover:border-red-500 rounded-xl p-8 text-center cursor-pointer transition-colors duration-150 bg-slate-950/60">
+              <svg class="h-10 w-10 mx-auto text-slate-500 mb-3" aria-hidden="true" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
               </svg>
               <p class="text-sm text-slate-300 font-medium">Click to select video</p>
@@ -640,9 +704,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <input type="file" id="videoFileInput" accept="video/*" class="hidden" />
             </div>
 
-            <div id="selectedFileInfo" class="mt-4 hidden p-3 rounded-lg bg-slate-800/60 border border-slate-700 text-xs flex items-center justify-between">
+            <div id="selectedFileInfo" class="mt-4 hidden p-3 rounded-lg bg-slate-800 border border-slate-700 text-xs flex items-center justify-between">
               <span id="fileNameDisplay" class="font-mono text-slate-200 truncate max-w-[200px]">video.mp4</span>
-              <button onclick="startAnalysis()" id="analyzeBtn" class="px-3 py-1.5 bg-red-600 hover:bg-red-500 text-white font-medium rounded-md shadow transition">
+              <button onclick="startAnalysis()" id="analyzeBtn" class="px-3 py-1.5 bg-red-600 hover:bg-red-500 text-white font-medium rounded-md transition-colors duration-150">
                 Analyze
               </button>
             </div>
@@ -650,7 +714,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
           <div id="analysisProgress" class="mt-4 hidden">
             <div class="flex justify-between text-xs text-slate-400 mb-1">
-              <span>Running Deep Action Inference...</span>
+              <span>Running deep action inference…</span>
               <span id="analysisTimer">0s</span>
             </div>
             <div class="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
@@ -661,11 +725,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         <!-- Right: Results Card -->
         <div class="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-6">
-          <h2 class="text-base font-semibold text-white mb-1">Analysis Telemetry & Timeline</h2>
+          <h2 class="text-base font-semibold text-white mb-1">Analysis Telemetry and Timeline</h2>
           <p class="text-xs text-slate-400 mb-4">Confidence probabilities, detected incidents, and forensic clips.</p>
 
           <div id="noResultsPlaceholder" class="h-64 flex flex-col items-center justify-center text-slate-500 text-sm">
-            <svg class="h-12 w-12 text-slate-600 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg class="h-12 w-12 text-slate-600 mb-2" aria-hidden="true" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
             </svg>
             No video analyzed yet. Upload a recording to view detection timeline.
@@ -674,7 +738,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div id="resultsContent" class="hidden space-y-5">
             <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
               <div class="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                <span class="text-xs text-slate-400 block">Peak Probability</span>
+                <span class="text-xs text-slate-400 block">Peak probability</span>
                 <span id="resPeakProb" class="text-lg font-bold text-white">0.00</span>
               </div>
               <div class="bg-slate-950 p-3 rounded-lg border border-slate-800">
@@ -682,27 +746,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <span id="resIncidentCount" class="text-lg font-bold text-red-400">0</span>
               </div>
               <div class="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                <span class="text-xs text-slate-400 block">Duration / Windows</span>
+                <span class="text-xs text-slate-400 block">Duration and windows</span>
                 <span id="resWindows" class="text-sm font-semibold text-slate-200">0s (0)</span>
               </div>
               <div class="bg-slate-950 p-3 rounded-lg border border-slate-800">
-                <span class="text-xs text-slate-400 block">Execution Speed</span>
+                <span class="text-xs text-slate-400 block">Execution speed</span>
                 <span id="resExecSpeed" class="text-sm font-semibold text-emerald-400">0.0s</span>
               </div>
             </div>
 
             <div>
-              <span class="text-xs font-semibold text-slate-300 block mb-2">Temporal Violence Probability Timeline:</span>
+              <span class="text-xs font-semibold text-slate-300 block mb-2">Temporal violence probability timeline:</span>
               <div id="timelineBars" class="h-20 bg-slate-950 rounded-lg border border-slate-800 p-2 flex items-end gap-1 overflow-x-auto"></div>
               <div class="flex justify-between text-[10px] text-slate-500 mt-1">
                 <span>0.0s</span>
-                <span class="text-red-400">--- Incident Onset Threshold (0.60) ---</span>
+                <span class="text-red-400">Incident onset threshold (0.60)</span>
                 <span id="timelineEndLabel">0.0s</span>
               </div>
             </div>
 
             <div id="detectedIncidentsBox" class="space-y-3">
-              <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400">Detected Incident Evidence Records:</h3>
+              <h3 class="text-xs font-semibold text-slate-300">Detected incident evidence records:</h3>
               <div id="incidentsList" class="space-y-3"></div>
             </div>
           </div>
@@ -718,28 +782,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="flex items-center justify-between mb-4">
             <div>
               <h2 class="text-base font-semibold text-white">Live Camera Safety Feed</h2>
-              <p class="text-xs text-slate-400">Processes continuous rolling spatiotemporal windows in real-time from webcam.</p>
+              <p class="text-xs text-slate-400">Processes continuous rolling spatiotemporal windows in real time from webcam.</p>
             </div>
-            <button onclick="toggleWebcam()" id="webcamToggleBtn" class="px-4 py-1.5 rounded-lg text-sm font-semibold bg-emerald-600 hover:bg-emerald-500 text-white transition shadow">
+            <button onclick="toggleWebcam()" id="webcamToggleBtn" class="px-4 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white transition-colors duration-150">
               Start Camera
             </button>
           </div>
 
           <div class="relative bg-black rounded-lg overflow-hidden aspect-video flex items-center justify-center border border-slate-800">
-            <video id="webcamVideo" autoplay playsinline muted class="w-full h-full object-cover hidden"></video>
+            <video id="webcamVideo" autoplay playsinline muted poster="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='120' fill='%23111827'></svg>" class="w-full h-full object-cover hidden"></video>
             <div id="webcamPlaceholder" class="text-center text-slate-500 text-sm p-8">
-              <svg class="h-12 w-12 mx-auto text-slate-600 mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <svg class="h-12 w-12 mx-auto text-slate-600 mb-2" aria-hidden="true" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/>
               </svg>
               Camera is currently inactive. Click <strong>Start Camera</strong> to begin live monitoring.
             </div>
 
             <div id="webcamHUD" class="hidden absolute top-3 left-3 right-3 flex justify-between items-center pointer-events-none">
-              <span id="liveStatusBadge" class="bg-emerald-500/90 text-black text-xs font-bold px-2.5 py-1 rounded shadow">
+              <span id="liveStatusBadge" class="bg-emerald-500 text-black text-xs font-bold px-2.5 py-1 rounded">
                 FEED NORMAL
               </span>
-              <span id="liveFpsBadge" class="bg-black/70 text-slate-300 text-xs px-2 py-0.5 rounded font-mono">
-                0 FPS
+              <span id="liveFpsBadge" class="bg-black/80 text-slate-300 text-xs px-2 py-0.5 rounded">
+                0 fps
               </span>
             </div>
           </div>
@@ -750,31 +814,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
           <div>
             <div class="flex justify-between text-xs mb-1">
-              <span class="text-slate-400">Violence Probability</span>
+              <span class="text-slate-400">Violence probability</span>
               <span id="liveProbVal" class="font-bold text-white">0%</span>
             </div>
             <div class="h-4 bg-slate-950 rounded-full overflow-hidden p-0.5 border border-slate-800">
-              <div id="liveProbGauge" class="h-full bg-emerald-500 rounded-full transition-all duration-300" style="width: 0%"></div>
+              <div id="liveProbGauge" class="h-full bg-emerald-500 rounded-full transition-colors duration-200" style="width: 0%"></div>
             </div>
           </div>
 
           <div class="p-4 rounded-lg bg-slate-950 border border-slate-800 space-y-2 text-xs">
             <div class="flex justify-between">
-              <span class="text-slate-400">Inference Engine:</span>
+              <span class="text-slate-400">Inference engine:</span>
               <span class="text-slate-200 font-mono">R(2+1)D-18</span>
             </div>
             <div class="flex justify-between">
-              <span class="text-slate-400">Window Size:</span>
+              <span class="text-slate-400">Window size:</span>
               <span class="text-slate-200 font-mono">16 frames (stride 2)</span>
             </div>
             <div class="flex justify-between">
-              <span class="text-slate-400">Alert Onset:</span>
+              <span class="text-slate-400">Alert onset:</span>
               <span class="text-slate-200 font-mono">&ge; 0.60</span>
             </div>
           </div>
 
           <div>
-            <h3 class="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">Live Session Incidents</h3>
+            <h3 class="text-xs font-semibold text-slate-300 mb-2">Live session incidents</h3>
             <div id="liveIncidentsList" class="space-y-2 max-h-56 overflow-y-auto custom-scrollbar text-xs text-slate-400">
               <p class="italic">No live incidents recorded yet.</p>
             </div>
@@ -791,7 +855,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <h2 class="text-base font-semibold text-white">RTSP CCTV Camera Network</h2>
             <p class="text-xs text-slate-400">Manage multi-camera RTSP surveillance streams with automated reconnection.</p>
           </div>
-          <button onclick="openAddCameraModal()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-600 hover:bg-red-500 text-white transition shadow flex items-center gap-1">
+          <button onclick="openAddCameraModal()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-600 hover:bg-red-500 text-white transition-colors duration-150 flex items-center gap-1">
             + Register Camera
           </button>
         </div>
@@ -810,10 +874,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <p class="text-xs text-slate-400">Forensic archive of detected safety altercations with human verification curation.</p>
           </div>
           <div class="flex gap-2">
-            <button onclick="exportReviewedDataset()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-700 hover:bg-red-600 text-white border border-red-600 transition">
+            <button onclick="exportReviewedDataset()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-700 hover:bg-red-600 text-white border border-red-600 transition-colors duration-150">
               Export Curated Dataset
             </button>
-            <button onclick="refreshIncidents()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition">
+            <button onclick="refreshIncidents()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors duration-150">
               Refresh Vault
             </button>
           </div>
@@ -821,20 +885,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         <div id="vaultTableContainer" class="overflow-x-auto">
           <table class="w-full text-left text-xs text-slate-300">
-            <thead class="bg-slate-950 uppercase tracking-wider text-slate-400 border-b border-slate-800">
+            <thead class="bg-slate-950 text-slate-400 border-b border-slate-800">
               <tr>
-                <th class="py-3 px-4">Incident ID</th>
-                <th class="py-3 px-4">Source / Video</th>
-                <th class="py-3 px-4">Timestamp Window</th>
-                <th class="py-3 px-4">Peak Confidence</th>
+                <th class="py-3 px-4">Incident id</th>
+                <th class="py-3 px-4">Source / video</th>
+                <th class="py-3 px-4">Timestamp window</th>
+                <th class="py-3 px-4">Peak confidence</th>
                 <th class="py-3 px-4">Severity</th>
-                <th class="py-3 px-4">Human Verification</th>
+                <th class="py-3 px-4">Human verification</th>
                 <th class="py-3 px-4 text-right">Actions</th>
               </tr>
             </thead>
             <tbody id="vaultTableBody" class="divide-y divide-slate-800">
               <tr>
-                <td colspan="7" class="py-8 text-center text-slate-500 italic">Loading incident records...</td>
+                <td colspan="7" class="py-8 text-center text-slate-500 italic">Loading incident records…</td>
               </tr>
             </tbody>
           </table>
@@ -851,10 +915,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <p class="text-xs text-slate-400">Security notifications dispatched to personnel, webhooks, and audit logs.</p>
           </div>
           <div class="flex gap-2">
-            <button onclick="triggerTestAlert()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition">
+            <button onclick="triggerTestAlert()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors duration-150">
               Dispatch Test Alert
             </button>
-            <button onclick="refreshAlerts()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition">
+            <button onclick="refreshAlerts()" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors duration-150">
               Refresh Alerts
             </button>
           </div>
@@ -868,65 +932,65 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </main>
 
   <!-- Evidence Playback & Human Review Modal -->
-  <div id="evidenceModal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-700 rounded-xl max-w-2xl w-full p-6 space-y-4 shadow-2xl">
+  <div id="evidenceModal" class="hidden fixed inset-0 z-50 bg-black/90 flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-xl max-w-2xl w-full p-6 space-y-4">
       <div class="flex justify-between items-center border-b border-slate-800 pb-3">
-        <h3 id="modalTitle" class="text-base font-bold text-white">Incident Evidence Review</h3>
-        <button onclick="closeModal()" class="text-slate-400 hover:text-white text-lg font-bold">&times;</button>
+        <h3 id="modalTitle" class="text-base font-semibold text-white">Incident Evidence Review</h3>
+        <button onclick="closeModal()" class="text-slate-400 hover:text-white text-lg font-bold" aria-label="Close dialog">&times;</button>
       </div>
 
       <div class="aspect-video bg-black rounded-lg overflow-hidden border border-slate-800">
-        <video id="modalVideo" controls autoplay class="w-full h-full object-contain"></video>
+        <video id="modalVideo" controls autoplay muted playsinline poster="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='120' fill='%23111827'></svg>" class="w-full h-full object-contain"></video>
       </div>
 
       <div class="grid grid-cols-2 gap-3 text-xs bg-slate-950 p-3 rounded-lg border border-slate-800">
-        <div><span class="text-slate-400">Incident Range:</span> <span id="modalRange" class="font-mono text-white"></span></div>
-        <div><span class="text-slate-400">Peak Probability:</span> <span id="modalPeak" class="font-mono text-red-400 font-bold"></span></div>
+        <div><span class="text-slate-400">Incident range:</span> <span id="modalRange" class="font-mono text-white"></span></div>
+        <div><span class="text-slate-400">Peak probability:</span> <span id="modalPeak" class="font-mono text-red-400 font-bold"></span></div>
         <div><span class="text-slate-400">Duration:</span> <span id="modalDuration" class="font-mono text-white"></span></div>
         <div><span class="text-slate-400">Severity:</span> <span id="modalSeverity" class="font-bold"></span></div>
       </div>
 
       <div class="space-y-2">
-        <label class="text-xs text-slate-400 block font-semibold">Security Operator Verification Decision:</label>
+        <label class="text-xs text-slate-400 block font-semibold">Security operator verification decision:</label>
         <div class="flex gap-4 text-xs">
           <label class="flex items-center gap-1.5 cursor-pointer">
             <input type="radio" name="reviewDecision" value="TRUE_POSITIVE" checked class="text-red-600 focus:ring-0">
-            <span class="text-red-400 font-semibold">TRUE_POSITIVE (Genuine Violence)</span>
+            <span class="text-red-400 font-semibold">True positive (genuine violence)</span>
           </label>
           <label class="flex items-center gap-1.5 cursor-pointer">
             <input type="radio" name="reviewDecision" value="FALSE_POSITIVE" class="text-emerald-600 focus:ring-0">
-            <span class="text-emerald-400 font-semibold">FALSE_POSITIVE (Normal/Benign)</span>
+            <span class="text-emerald-400 font-semibold">False positive (normal or benign)</span>
           </label>
           <label class="flex items-center gap-1.5 cursor-pointer">
             <input type="radio" name="reviewDecision" value="UNCERTAIN" class="text-amber-600 focus:ring-0">
-            <span class="text-amber-400 font-semibold">UNCERTAIN</span>
+            <span class="text-amber-400 font-semibold">Uncertain</span>
           </label>
         </div>
-        <textarea id="modalNotes" rows="2" class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-red-500" placeholder="Operator notes and escalation context..."></textarea>
+        <textarea id="modalNotes" rows="2" class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-red-500" placeholder="Operator notes and escalation context…"></textarea>
       </div>
 
       <div class="flex justify-end gap-3 pt-2">
-        <button onclick="closeModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition">
+        <button onclick="closeModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition-colors duration-150">
           Cancel
         </button>
-        <button onclick="submitReviewFromModal()" class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-xs font-semibold transition shadow">
-          Submit Human Verification
+        <button onclick="submitReviewFromModal()" class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-xs font-semibold whitespace-nowrap transition-colors duration-150">
+          Verify Incident
         </button>
       </div>
     </div>
   </div>
 
   <!-- Register Camera Modal -->
-  <div id="addCameraModal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-    <div class="bg-slate-900 border border-slate-700 rounded-xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+  <div id="addCameraModal" class="hidden fixed inset-0 z-50 bg-black/90 flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-xl max-w-md w-full p-6 space-y-4">
       <div class="flex justify-between items-center border-b border-slate-800 pb-3">
-        <h3 class="text-base font-bold text-white">Register Surveillance Camera</h3>
-        <button onclick="closeAddCameraModal()" class="text-slate-400 hover:text-white text-lg font-bold">&times;</button>
+        <h3 class="text-base font-semibold text-white">Register Surveillance Camera</h3>
+        <button onclick="closeAddCameraModal()" class="text-slate-400 hover:text-white text-lg font-bold" aria-label="Close dialog">&times;</button>
       </div>
 
       <div class="space-y-3 text-xs">
         <div>
-          <label class="text-slate-400 block mb-1">Camera ID:</label>
+          <label class="text-slate-400 block mb-1">Camera id:</label>
           <input type="text" id="camIdInput" class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-white" placeholder="e.g. cam_front_gate" />
         </div>
         <div>
@@ -938,20 +1002,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <input type="text" id="camLocationInput" class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-white" placeholder="e.g. Building A - Exterior" />
         </div>
         <div>
-          <label class="text-slate-400 block mb-1">Stream URL (RTSP / Local File):</label>
+          <label class="text-slate-400 block mb-1">Stream url (RTSP or local file):</label>
           <input type="text" id="camUrlInput" class="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-white font-mono" placeholder="rtsp://192.168.1.50:554/live or data/raw/violence/punching_001.mp4" />
         </div>
       </div>
 
       <div class="flex justify-end gap-3 pt-2">
-        <button onclick="closeAddCameraModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition">Cancel</button>
-        <button onclick="submitNewCamera()" class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-xs font-semibold transition shadow">Save Camera</button>
+        <button onclick="closeAddCameraModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition-colors duration-150">Cancel</button>
+        <button onclick="submitNewCamera()" class="px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-xs font-semibold transition-colors duration-150">Save Camera</button>
       </div>
     </div>
   </div>
 
-  <footer class="border-t border-slate-800/80 bg-slate-950/60 px-6 py-3 text-center text-xs text-slate-500">
-    SafeTV &mdash; AI Surveillance Safety &amp; Violence Detection Platform &bull; Intel CPU Optimized
+  <footer class="border-t border-slate-800 bg-slate-950 px-6 py-3 text-center text-xs text-slate-500">
+    SafeTV: AI Surveillance Safety and Violence Detection Platform (Intel CPU Optimized)
   </footer>
 
   <script>
@@ -1072,7 +1136,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const bar = document.createElement('div');
         const prob = w.smoothed_violence_prob;
         const heightPct = Math.min(100, Math.max(10, prob * 100));
-        bar.className = 'w-2.5 rounded-t transition flex-shrink-0';
+        bar.className = 'w-2.5 rounded-t flex-shrink-0 transition-colors duration-150';
         bar.style.height = `${heightPct}%`;
         if (prob >= 0.60) {
           bar.classList.add('bg-red-500');
@@ -1098,12 +1162,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <div class="flex items-center gap-2 mb-1">
                 <span class="px-2 py-0.5 rounded font-bold bg-red-500 text-white">${inc.severity}</span>
                 <span class="font-semibold text-white">Incident #${inc.incident_id}</span>
-                <span class="text-slate-400">${inc.start_time_sec.toFixed(2)}s &mdash; ${inc.end_time_sec.toFixed(2)}s</span>
+                <span class="text-slate-400">${inc.start_time_sec.toFixed(2)}s to ${inc.end_time_sec.toFixed(2)}s</span>
               </div>
-              <p class="text-slate-400">Peak Confidence: <strong class="text-red-400 font-mono">${(inc.peak_probability * 100).toFixed(1)}%</strong> &bull; Duration: ${inc.duration_sec.toFixed(2)}s</p>
+              <p class="text-slate-400">Peak confidence: <strong class="text-red-400 font-mono">${(inc.peak_probability * 100).toFixed(1)}%</strong> (duration: ${inc.duration_sec.toFixed(2)}s)</p>
             </div>
             ${inc.evidence_filename ? `
-              <button onclick="openModal('${inc.incident_id}', '${inc.evidence_filename}', '${inc.start_time_sec.toFixed(2)}s - ${inc.end_time_sec.toFixed(2)}s', '${(inc.peak_probability * 100).toFixed(1)}%', '${inc.duration_sec.toFixed(2)}s', '${inc.severity}')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-md font-medium transition">
+              <button onclick="openModal('${inc.incident_id}', '${inc.evidence_filename}', '${inc.start_time_sec.toFixed(2)}s - ${inc.end_time_sec.toFixed(2)}s', '${(inc.peak_probability * 100).toFixed(1)}%', '${inc.duration_sec.toFixed(2)}s', '${inc.severity}')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-md font-medium transition-colors duration-150">
                 Review Clip
               </button>
             ` : ''}
@@ -1177,7 +1241,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     async function startWebcam() {
       const vid = document.getElementById('webcamVideo');
       try {
-        // Start backend persistent session
         const sessionResp = await fetch('/api/webcam/session/start', { method: 'POST' });
         const sessionData = await sessionResp.json();
         activeWebcamSessionId = sessionData.session_id;
@@ -1206,7 +1269,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const b64 = canvas.toDataURL('image/jpeg', 0.6);
           capturedFramesBuffer.push(b64);
 
-          // Stream batch to persistent session every 8 frames
           if (capturedFramesBuffer.length >= 8) {
             const batch = capturedFramesBuffer.slice();
             capturedFramesBuffer = [];
@@ -1273,17 +1335,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const banner = document.getElementById('liveAlertBanner');
 
       if (prob >= 0.60) {
-        gauge.className = 'h-full bg-red-600 rounded-full transition-all duration-200';
+        gauge.className = 'h-full bg-red-600 rounded-full transition-colors duration-150';
         badge.className = 'bg-red-600 text-white text-xs font-bold px-2.5 py-1 rounded shadow animate-pulse';
         badge.textContent = 'ALERT: VIOLENCE';
         banner.classList.remove('hidden');
       } else if (prob >= 0.40) {
-        gauge.className = 'h-full bg-amber-500 rounded-full transition-all duration-200';
+        gauge.className = 'h-full bg-amber-500 rounded-full transition-colors duration-150';
         badge.className = 'bg-amber-500 text-black text-xs font-bold px-2.5 py-1 rounded shadow';
         badge.textContent = 'ELEVATED MOTION';
         banner.classList.add('hidden');
       } else {
-        gauge.className = 'h-full bg-emerald-500 rounded-full transition-all duration-200';
+        gauge.className = 'h-full bg-emerald-500 rounded-full transition-colors duration-150';
         badge.className = 'bg-emerald-500 text-black text-xs font-bold px-2.5 py-1 rounded shadow';
         badge.textContent = 'FEED NORMAL';
         banner.classList.add('hidden');
@@ -1366,7 +1428,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <div class="flex justify-between"><span>Threat Prob:</span><span class="${cam.current_violence_prob >= 0.60 ? 'text-red-400 font-bold' : 'text-slate-200'}">${(cam.current_violence_prob * 100).toFixed(1)}% (Peak: ${(cam.peak_violence_prob * 100).toFixed(1)}%)</span></div>
             </div>
             <div class="flex justify-between items-center pt-1">
-              <button onclick="toggleCamera('${cam.camera_id}', ${isRunning})" class="px-3 py-1 rounded text-xs font-semibold ${isRunning ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-emerald-600 hover:bg-emerald-500 text-white'} transition">
+              <button onclick="toggleCamera('${cam.camera_id}', ${isRunning})" class="px-3 py-1 rounded text-xs font-semibold ${isRunning ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-emerald-600 hover:bg-emerald-500 text-white'} transition-colors duration-150">
                 ${isRunning ? 'Stop Stream' : 'Start Stream'}
               </button>
               <button onclick="deleteCamera('${cam.camera_id}')" class="text-xs text-red-400 hover:text-red-300">
@@ -1467,7 +1529,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         incidents.forEach(inc => {
           const tr = document.createElement('tr');
-          tr.className = 'hover:bg-slate-800/40 transition';
+          tr.className = 'hover:bg-slate-800/40 transition-colors duration-150';
 
           const range = `${inc.incident_temporal_window.start_time_sec.toFixed(2)}s - ${inc.incident_temporal_window.end_time_sec.toFixed(2)}s`;
           const peak = `${(inc.detection_metrics.peak_probability * 100).toFixed(1)}%`;
@@ -1485,8 +1547,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <td class="py-3 px-4"><span class="px-2 py-0.5 rounded text-[10px] font-bold bg-red-950 text-red-400 border border-red-800">${inc.detection_metrics.severity}</span></td>
             <td class="py-3 px-4"><span class="px-2 py-0.5 rounded text-[10px] font-semibold ${statusClass}">${inc.status}</span></td>
             <td class="py-3 px-4 text-right">
-              <button onclick="openModal('${inc.incident_id}', '${clipName}', '${range}', '${peak}', '${inc.incident_temporal_window.duration_sec}s', '${inc.detection_metrics.severity}')" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded font-medium transition text-xs">
-                Play &amp; Review
+              <button onclick="openModal('${inc.incident_id}', '${clipName}', '${range}', '${peak}', '${inc.incident_temporal_window.duration_sec}s', '${inc.detection_metrics.severity}')" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded font-medium transition-colors duration-150 text-xs">
+                Play and review
               </button>
             </td>
           `;
@@ -1529,8 +1591,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     });
   </script>
 </body>
-</html>
-"""
+</html>"""
 
 
 @app.get("/", response_class=HTMLResponse)
