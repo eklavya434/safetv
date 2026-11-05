@@ -9,6 +9,7 @@ Enforces model integrity, path traversal protection, and human-in-the-loop revie
 import base64
 import datetime
 import glob
+import hmac
 import json
 import logging
 import os
@@ -80,7 +81,7 @@ def verify_api_key(x_api_key: Optional[str] = Header(None)) -> None:
     """Verifies optional API key when configured in environment."""
     required_key = os.getenv("SAFETV_API_KEY")
     if required_key:
-        if not x_api_key or x_api_key != required_key:
+        if not x_api_key or not hmac.compare_digest(x_api_key, required_key):
             raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing X-API-Key.")
 
 
@@ -311,6 +312,8 @@ async def analyze_stream_window(payload: WebcamWindowPayload, _: None = Depends(
     """
     if len(payload.frames_base64) < 4:
         raise HTTPException(status_code=400, detail="Insufficient frames for window inference.")
+    if len(payload.frames_base64) > 64:
+        raise HTTPException(status_code=400, detail="Frame batch exceeds maximum window size of 64 frames.")
 
     decoded_frames = []
     for b64 in payload.frames_base64:
@@ -406,8 +409,11 @@ def _validate_camera_url(url: str) -> None:
                             detail=f"Camera hostname '{hostname}' resolves to private address '{resolved_ip}'. "
                                    "Set SAFETV_ALLOWED_CAMERA_HOSTS to allow this host."
                         )
-            except socket.gaierror:
-                pass
+            except socket.gaierror as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Camera hostname '{hostname}' could not be resolved: {e}"
+                )
 
 
 # CCTV Multi-Camera Endpoints

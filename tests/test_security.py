@@ -183,5 +183,49 @@ class TestDNSRebindingProtection(unittest.TestCase):
         validate_stream_url("file:///test.mp4", allow_private=False)
 
 
+class TestAPIKeySecurity(unittest.TestCase):
+    """Validates constant-time API key verification."""
+
+    def test_invalid_api_key_rejected(self):
+        from safetv.server import verify_api_key
+        from fastapi import HTTPException
+        old_env = os.environ.get("SAFETV_API_KEY")
+        os.environ["SAFETV_API_KEY"] = "secret-token-12345"
+        try:
+            with self.assertRaises(HTTPException) as ctx:
+                verify_api_key(x_api_key="wrong-token")
+            self.assertEqual(ctx.exception.status_code, 401)
+        finally:
+            if old_env is not None:
+                os.environ["SAFETV_API_KEY"] = old_env
+            else:
+                os.environ.pop("SAFETV_API_KEY", None)
+
+    def test_valid_api_key_accepted(self):
+        from safetv.server import verify_api_key
+        old_env = os.environ.get("SAFETV_API_KEY")
+        os.environ["SAFETV_API_KEY"] = "secret-token-12345"
+        try:
+            verify_api_key(x_api_key="secret-token-12345")
+        finally:
+            if old_env is not None:
+                os.environ["SAFETV_API_KEY"] = old_env
+            else:
+                os.environ.pop("SAFETV_API_KEY", None)
+
+
+class TestStreamWindowSecurityBounds(unittest.TestCase):
+    """Validates entity and batch bounds on stream window ingestion."""
+
+    def test_oversized_frame_batch_rejected(self):
+        from fastapi.testclient import TestClient
+        from safetv.server import app
+        client = TestClient(app)
+        frames = ["dGVzdA==" for _ in range(65)]
+        resp = client.post("/api/analyze/stream-window", json={"frames_base64": frames, "fps": 15.0})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("exceeds maximum window size", resp.json().get("detail", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
