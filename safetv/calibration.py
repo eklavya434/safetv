@@ -33,10 +33,13 @@ class ProbabilityCalibrator:
     Evaluates probability calibration and applies temperature scaling to uncalibrated logits.
     """
 
-    def __init__(self, temperature: float = 1.0, calibration_file: Optional[str] = None):
-        self.temperature: float = max(0.01, float(temperature))
+    def __init__(self, temperature: Optional[float] = None, calibration_file: Optional[str] = None):
         self.calibration_file = calibration_file or "models/violence_detector/calibration.json"
-        self._load_calibration()
+        if temperature is not None:
+            self.temperature: float = max(0.01, float(temperature))
+        else:
+            self.temperature: float = 1.0
+            self._load_calibration()
 
     def _load_calibration(self) -> None:
         """Load temperature parameter if available."""

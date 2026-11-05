@@ -95,5 +95,9 @@
         "total": 2
       }
     }
+  },
+  "calibration": {
+    "temperature": 0.05,
+    "validation_clips_used": 3
   }
 }
