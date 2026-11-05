@@ -26,6 +26,7 @@ wheels/
 
 # PyTorch / Models / Checkpoints
 *.pth
+!models/violence_detector/best_model.pth.part*
 *.pt
 *.onnx
 *.engine

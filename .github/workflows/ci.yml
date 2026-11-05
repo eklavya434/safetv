@@ -34,6 +34,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Reassemble Model Checkpoint
+        run: |
+          cat models/violence_detector/best_model.pth.part* > models/violence_detector/best_model.pth
+
       - name: Run Full SafeTV Test Suite
         run: |
           python -m unittest discover -s tests -v

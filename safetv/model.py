@@ -95,13 +95,32 @@ class VideoActionClassifier:
 
             # Attempt to automatically load trained checkpoint
             checkpoint = getattr(self.config, "checkpoint_path", None)
-            if checkpoint and os.path.exists(checkpoint):
-                try:
-                    self.load_checkpoint(checkpoint)
-                except ModelNotReadyError as e:
+            if checkpoint:
+                if not os.path.exists(checkpoint) and os.path.exists(checkpoint + ".part0"):
+                    import glob
+                    import shutil
+                    logger.info(f"Reassembling split checkpoint parts for {checkpoint}...")
+                    parts = sorted(glob.glob(checkpoint + ".part*"))
+                    with open(checkpoint, "wb") as outfile:
+                        for p in parts:
+                            with open(p, "rb") as infile:
+                                shutil.copyfileobj(infile, outfile)
+
+                if os.path.exists(checkpoint):
+                    try:
+                        self.load_checkpoint(checkpoint)
+                    except ModelNotReadyError as e:
+                        self.is_trained = False
+                        self.is_ready = False
+                        logger.warning(f"Failed to load checkpoint '{checkpoint}': {e}")
+                else:
                     self.is_trained = False
                     self.is_ready = False
-                    logger.warning(f"Failed to load checkpoint '{checkpoint}': {e}")
+                    self.provenance = "uncalibrated_backbone"
+                    self.model_status_message = (
+                        f"Trained checkpoint '{checkpoint}' not found. Model is in uncalibrated state."
+                    )
+                    logger.warning(self.model_status_message)
             else:
                 self.is_trained = False
                 self.is_ready = False
@@ -134,6 +153,19 @@ class VideoActionClassifier:
         Load genuinely trained model weights with strict integrity and key validation.
         """
         import torch
+        if not os.path.exists(checkpoint_path):
+            # Check if split parts exist and automatically reassemble
+            part0 = checkpoint_path + ".part0"
+            if os.path.exists(part0):
+                import glob
+                import shutil
+                logger.info(f"Reassembling split checkpoint parts for {checkpoint_path}...")
+                parts = sorted(glob.glob(checkpoint_path + ".part*"))
+                with open(checkpoint_path, "wb") as outfile:
+                    for p in parts:
+                        with open(p, "rb") as infile:
+                            shutil.copyfileobj(infile, outfile)
+
         if not os.path.exists(checkpoint_path):
             self.is_trained = False
             self.is_ready = False
